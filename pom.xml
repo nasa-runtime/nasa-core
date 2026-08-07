@@ -4,7 +4,7 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.nasa.runtime</groupId>
+    <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-core</artifactId>
     <version>1.0.0</version>
     <packaging>jar</packaging>
@@ -30,6 +30,7 @@
     <developers>
         <developer>
             <name>Nasa Runtime Contributors</name>
+            <url>https://github.com/nasa-runtime</url>
             <organization>Nasa Runtime</organization>
             <organizationUrl>https://github.com/nasa-runtime</organizationUrl>
         </developer>
@@ -38,8 +39,8 @@
     <scm>
         <connection>scm:git:https://github.com/nasa-runtime/nasa-core.git</connection>
         <developerConnection>scm:git:ssh://git@github.com/nasa-runtime/nasa-core.git</developerConnection>
-        <tag>HEAD</tag>
-        <url>https://github.com/nasa-runtime/nasa-core/tree/main</url>
+        <tag>v${project.version}</tag>
+        <url>https://github.com/nasa-runtime/nasa-core/tree/v${project.version}</url>
     </scm>
 
     <issueManagement>
@@ -182,7 +183,7 @@
                             <addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
                         </manifest>
                         <manifestEntries>
-                            <Automatic-Module-Name>com.nasa.runtime.core</Automatic-Module-Name>
+                            <Automatic-Module-Name>io.github.nasaruntime.core</Automatic-Module-Name>
                             <Implementation-Vendor>Nasa Runtime</Implementation-Vendor>
                         </manifestEntries>
                     </archive>
@@ -228,6 +229,25 @@
             <id>central-release</id>
             <build>
                 <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <executions>
+                            <execution>
+                                <id>require-central-release-coordinates</id>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <requireReleaseVersion/>
+                                        <requireReleaseDeps/>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-gpg-plugin</artifactId>
