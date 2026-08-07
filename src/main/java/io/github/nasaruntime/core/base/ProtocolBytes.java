@@ -112,7 +112,7 @@ public interface ProtocolBytes {
     }
 
     /**
-     * 业务作用：业务作用：单个字段的二进制访问器。除类型信息外还缓存 wire type 与固定长度，使 VARINT 与 FAST_FIXED 两种模式都不必在编解码时重新推导。
+     * 业务作用：单个字段的二进制访问器。除类型信息外还缓存 wire type 与固定长度，使 VARINT 与 FAST_FIXED 两种模式都不必在编解码时重新推导。
      *
      * 字段访问器: tag (= @Protocols.value) + 字段名 (JSON_BYTES 用) + VarHandle + 类型 +
      * 元素类型 (容器场景) + wire type + 固定长度.
@@ -132,7 +132,7 @@ public interface ProtocolBytes {
     }
 
     /**
-     * 业务作用：业务作用：单个消息类型的二进制编解码元数据。每个 Class 只反射解析一次并缓存；totalFixedSize 为负表示存在变长字段，FAST_FIXED 模式据此拒绝该类型。
+     * 业务作用：单个消息类型的二进制编解码元数据。每个 Class 只反射解析一次并缓存；totalFixedSize 为负表示存在变长字段，FAST_FIXED 模式据此拒绝该类型。
      *
      * 类级元数据.
      * <ul>

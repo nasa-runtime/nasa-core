@@ -87,7 +87,7 @@ public interface Protocol {
     ConcurrentHashMap<Class<?>, Meta> META = new ConcurrentHashMap<>();
 
     /**
-     * 业务作用：业务作用：单个字段的访问器。把 tag、VarHandle、字段类型、集合元素类型与转换器一次性解析好并缓存，使编解码热路径不必重复走反射。tag 是 TAG_VALUE 模式的查表键，发布后不可复用或修改。
+     * 业务作用：单个字段的访问器。把 tag、VarHandle、字段类型、集合元素类型与转换器一次性解析好并缓存，使编解码热路径不必重复走反射。tag 是 TAG_VALUE 模式的查表键，发布后不可复用或修改。
      *
      * 单个字段的访问器: tag (用于 TAG_VALUE 模式查表) + VarHandle + 类型 + 元素类型 + 转换器.
      * @param tag 见上述说明
@@ -102,7 +102,7 @@ public interface Protocol {
     }
 
     /**
-     * 业务作用：业务作用：单个消息类型的编解码元数据。每个 Class 只反射解析一次并缓存，其中 scratch 与 inEncode 用于复用编码期临时结构，避免逐条消息分配。
+     * 业务作用：单个消息类型的编解码元数据。每个 Class 只反射解析一次并缓存，其中 scratch 与 inEncode 用于复用编码期临时结构，避免逐条消息分配。
      *
      * 类级元数据.
      * <ul>

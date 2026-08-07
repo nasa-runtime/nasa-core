@@ -151,6 +151,14 @@
                                     <version>[21,)</version>
                                 </requireJavaVersion>
                                 <dependencyConvergence/>
+                                <requireFilesDontExist>
+                                    <files>
+                                        <file>${project.basedir}/src/test</file>
+                                        <file>${project.basedir}/test</file>
+                                        <file>${project.basedir}/tests</file>
+                                    </files>
+                                    <message>nasa-core 仓库禁止包含测试源码或测试目录；请在仓库外执行黑盒回归和长稳压测。</message>
+                                </requireFilesDontExist>
                             </rules>
                         </configuration>
                     </execution>

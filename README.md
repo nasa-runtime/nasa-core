@@ -23,21 +23,31 @@
 把任务按业务 key 哈希到固定原始分区，每个分区一条 worker 独占消费自己的 MPSC 队列。严格任务在“原始分区 + taskType”边界内维持 FIFO；非严格任务允许经多个盗洞并行分发和任务粒度重排，因此不能把“同 key”一概理解为串行执行。分区空闲时会向繁忙分区安装“盗洞”窃取任务，缓解负载倾斜。
 
 ```java
+// Partition 的延迟提交与归还收口依赖 TimingWheel，必须先启动时间轮。
+TimingWheel.startTimingWheel();
 Partition.start();
 
 // fire-and-forget：不需要句柄，零句柄分配
-Partition.exec(orderId, task);
+Partition.exec(orderId, fireAndForgetTask);
 
 // 需要状态查询或取消能力时用 submit，返回稳定句柄
-try (Partition.Submission s = Partition.submit(orderId, task)) {
+try (Partition.Submission s = Partition.submit(orderId, cancellableTask)) {
     if (s.status() == Partition.Submission.Status.QUEUED) s.cancel();
 }
 
 // 延迟入队：延迟部分交给 TimingWheel，到期后才进入分区队列
-Partition.exec(orderId, 500L, task);
+Partition.exec(orderId, 500L, delayedTask);
 
-Partition.stop();
+// 必须先等 Partition 完全收口，再停止 TimingWheel，避免延迟任务被截断。
+while (!Partition.stop()) {
+    // stop 超时返回 false 时仍处于 STOPPING；再次调用会继续等待本轮收口。
+}
+TimingWheel.of().stop();
 ```
+
+每次提交都必须使用独立的 `Task` 实例；任务对象承载本次提交的所有权状态，入队后不得并发复用或再次提交。
+`taskType()` 必须在任务生命周期内保持稳定，并且同一 `taskType` 不能混用不同的 `strictOrder()` 值；
+`getOwner()`、`setOwner()` 和 `compareAndSetOwner()` 必须提供线程安全的所有权读写与 CAS，所有权字段由框架管理，业务代码不得并发修改。
 
 业务任务实现 `Partition.Task`，其中 `strictOrder()` 决定该任务类型是否要求严格保序：
 
@@ -66,6 +76,9 @@ TimingWheel.platform(1000L, () -> { ... });                // 需要平台线程
 
 TimingWheel.delay("order:" + id, 3000L);                   // 改期
 TimingWheel.cancel("order:" + id);                         // 取消
+
+// ...应用继续运行，到停机阶段再关闭时间轮...
+TimingWheel.of().stop();                                   // 应用停机时调用
 ```
 
 以 `wheelSize=1000, tickMs=1` 为例的分层结构：第一层 1ms 粒度覆盖 0~1s，第二层 1s 粒度覆盖 0~1000s，更高层按需创建。默认走虚拟线程执行（`exec`），需要平台线程语义时用 `platform` 系列。

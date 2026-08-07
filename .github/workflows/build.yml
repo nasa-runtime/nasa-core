@@ -22,4 +22,4 @@ jobs:
           java-version: "21"
           cache: maven
       - name: Build release artifacts
-        run: mvn -B -ntp clean package
+        run: mvn -B -ntp clean verify

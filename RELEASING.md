@@ -9,7 +9,9 @@
 - Central Portal 已生成 User Token。
 - 本机已配置 GPG 主签名密钥，公钥已上传至 Central 支持的公开 key server。
 - Git 工作区干净，`pom.xml`、README 和变更记录中的版本一致。
+- `CHANGELOG.md` 中本次版本已经从“未发布”切换为实际发布日期。
 - 当前提交已推送到 `https://github.com/nasa-runtime/nasa-core`。
+- 仓库不含测试源码以及 `src/test`、`test`、`tests` 目录；发布验收使用仓库外黑盒探针，结果必须由人工确认账目、顺序、停机和异常记录均符合预期。
 
 Central 凭证放在用户级 `~/.m2/settings.xml`，不要写入项目：
 
@@ -44,6 +46,8 @@ Central Portal 的 DNS TXT 流程证明对根域名 `nasa.com` 的控制权，�
 ```bash
 mvn -B -ntp clean verify
 ```
+
+基础构建中的 Maven Enforcer 会拒绝仓库内出现测试目录，防止发布提交绕过上述边界。
 
 `target/` 中必须至少存在：
 

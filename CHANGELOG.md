@@ -2,7 +2,7 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## 1.0.0 - 未发布
+## 1.0.0 - 2026-08-08
 
 首个公开版本。从 Nasa Runtime 拆分为独立的纯 Java 基础库，不依赖容器或框架，不继承外部 parent POM。
 
@@ -23,7 +23,7 @@
 
 - JDK 21 或更高版本（使用虚拟线程与 Java 21 语法），Maven 3.6.3 或更高版本。
 - 编译产物为 Java 21 字节码，低于 JDK 21 的项目无法加载。
-- 运行期只依赖 `slf4j-api`，日志实现由使用方选择。
+- 日志门面只依赖 `slf4j-api`，日志实现由使用方选择；Jackson、Guava、Fastjson2 与 Commons Codec 等功能依赖由 Maven 坐标传递管理。
 
 ### 许可
 
