@@ -1,12 +1,14 @@
 package io.github.nasaruntime.core.base;
 
 import io.github.nasaruntime.core.concurrent.MPSCLinkedQueue;
+import io.github.nasaruntime.core.function.Action;
 import io.github.nasaruntime.core.function.ActionRecycler;
 import lombok.extern.slf4j.Slf4j;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayDeque;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -23,8 +25,8 @@ import java.util.function.Consumer;
 /**
  * 独立分区消费子系统。
  *
- * <p>本类拥有固定分区路由、MPSC 队列、唯一 consumer worker、任务类型策略、精确逻辑计数、
- * 取消和故障门禁。路由 key 只决定原始分区；严格顺序边界是“原始分区 + 任务类型”。
+ * <p>本类拥有固定分区路由、MPSC 队列、唯一 consumer worker、集中负载观察者、任务类型策略、
+ * 精确逻辑计数、取消和故障门禁。路由 key 只决定原始分区；严格顺序边界是“原始分区 + 任务类型”。
  * 非严格任务可经多盗洞分发，严格任务通过代次门禁完成整体迁移和有界归还；延迟入口只负责到期后
  * 重新进入当前路由，不预占任何分区负载。</p>
  */
@@ -35,8 +37,8 @@ public final class Partition {
      * 分区消费任务。
      *
      * <p>路由 key 只决定原始分区；严格顺序边界由“原始分区 + {@link #taskType()}”共同确定。
-     * 任务进入分区架构后，类型和保序属性都不得改变。所有权方法必须提供跨线程原子可见性，
-     * 推荐使用 {@code VarHandle} 或 {@code AtomicInteger} 实现。</p>
+     * 任务进入分区架构后，类型和保序属性都不得改变。所有权方法必须提供跨线程原子可见性并有界完成，
+     * 不得执行 I/O、等待业务锁或外部服务；推荐使用 {@code VarHandle} 或 {@code AtomicInteger} 实现。</p>
      */
     public interface Task {
 
@@ -97,7 +99,8 @@ public final class Partition {
      * 句柄本身不进入对象池，因此即使内部条目已经被另一笔任务复用，旧引用也只会 fail-fast，
      * 绝不会观察或取消新任务。调用方使用完必须执行 {@link #recycle()} 或 {@link #close()}，
      * 否则对应内部条目不能归池；不需要查询或取消能力的 fire-and-forget 任务应使用 {@link #exec(Object, Task)}。
-     * 句柄释放后不得再访问旧引用。</p>
+     * 句柄释放后不得再访问旧引用。状态读取和取消不是无阻塞 API：若另一线程正在发布业务所有权终态，
+     * 调用会等待该发布完整收口；超过迁移总时限会冻结所属类型并记录故障，但不会返回猜测状态。</p>
      */
     public interface Submission extends AutoCloseable {
 
@@ -129,7 +132,7 @@ public final class Partition {
          * 业务作用：读取提交当前生命周期，供调用方判断任务是否仍可能执行。
          *
          * 参数说明: 无。
-         * 返回: 当前原子状态对应的公开枚举值。
+         * 返回: 当前完整发布的权威状态；终态发布尚未收口时等待，句柄已释放时抛出 IllegalStateException。
          */
         Status status();
 
@@ -137,7 +140,8 @@ public final class Partition {
          * 业务作用：在任务开始执行前竞争取消权；成功者负责发布终态并只减少一次逻辑计数。
          *
          * 参数说明: 无。
-         * 返回: 本次调用成功把未执行任务取消时返回 true；任务已运行、完成、拒绝或已被取消时返回 false。
+         * 返回: 本次调用成功把未执行任务取消时返回 true；任务已运行、完成、拒绝或已被取消时返回 false；
+         * 并发终态发布或业务所有权回调未完成时可能等待。
          */
         boolean cancel();
 
@@ -184,12 +188,22 @@ public final class Partition {
     private static final int DEFAULT_DRAIN_BATCH = 1_024;
     private static final long DEFAULT_STOP_TIMEOUT_MILLIS = 5_000L;
     private static final long DEFAULT_TUNNEL_LEASE_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
-    private static final long STEAL_RETRY_NANOS = TimeUnit.MILLISECONDS.toNanos(2L);
+    /** 集中负载观察的内部节流周期；盗洞扩容不承担普通任务的低延迟唤醒职责。 */
+    private static final long LOAD_OBSERVER_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1L);
+    /** 分区观察任务进入 TimingWheel 1ms 快速通道所用的唯一周期。 */
+    private static final long OBSERVER_INTERVAL_MILLIS = 1L;
+    /** 单个热点观察批次为严格候选尝试的目标上限，避免首个目标瞬态拒绝后整轮丢失机会。 */
+    private static final int STRICT_OPPORTUNITY_ATTEMPTS = 3;
     /** 停机排空期间无进度时的 park 时长：停机路径不会有新任务到达，忙循环只会空烧 CPU。 */
     private static final long STOP_DRAIN_PARK_NANOS = TimeUnit.MILLISECONDS.toNanos(1L);
     private static final Object GATE_IDLE = new Object();
     private static final Object GATE_RUNNING = new Object();
     private static final Partition INSTANCE = new Partition();
+    /** 进程内实例后缀隔离 TimingWheel 的公开 unique 命名空间，避免取消同名业务任务。 */
+    private static final String OBSERVER_UNIQUE = Partition.class.getName()
+            + ".observer@" + Integer.toHexString(System.identityHashCode(INSTANCE));
+    /** 分区观察动作只创建一次，由 TimingWheel 快速通道复用。 */
+    private static final Action OBSERVER_ACTION = INSTANCE::advanceObserver;
     /** 延迟到期动作使用无捕获策略，逐笔参数放入池化 ActionRecycler 槽位。 */
     private static final Consumer<ActionRecycler> DELAYED_EXPIRY_ACTION = Partition::runDelayedExpiryAction;
 
@@ -198,8 +212,19 @@ public final class Partition {
     private final AtomicReference<Lifecycle> lifecycle = new AtomicReference<>(Lifecycle.stopped(0L));
     private final AtomicInteger failedPartitionCount = new AtomicInteger();
     private final AtomicLong delayedSequence = new AtomicLong();
+    /** 阻止旧代快速通道回调与当前观察任务并发处理不同代次。 */
+    private final AtomicBoolean observerRunning = new AtomicBoolean();
+    /** 下一次允许执行 O(N) 热点扫描的单调时钟时刻，由唯一观察任务更新。 */
+    private volatile long nextLoadObservationNanos;
+    /** 唯一负载观察者发布的批次代次，使源 worker 能在固定预算内跨目标接力严格候选机会。 */
+    private long loadObservationEpoch;
+    /** 只登记存在严格迁移或归还状态的源槽及其最新声明，避免快速通道扫描全部分区或误删新责任。 */
+    private final ConcurrentHashMap<PartitionSlot, MigrationClaim> activeStrictControlSources =
+            new ConcurrentHashMap<>();
     private final ConcurrentHashMap<TaskEntry, Boolean> delayedRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<TaskEntry, Boolean> movingRegistry = new ConcurrentHashMap<>();
+    /** 只登记至少关联一条 MOVING 任务的槽位，使 1ms 快速通道的唤醒成本受分区数约束。 */
+    private final ConcurrentHashMap<PartitionSlot, Boolean> activeMovingAuditSlots = new ConcurrentHashMap<>();
     /** 迁移审计读侧计数与回收门禁共同提供一次轻量 grace period，阻止弱一致迭代器访问已复用条目。 */
     private final AtomicInteger movingAuditors = new AtomicInteger();
     private final AtomicBoolean movingRecycleGate = new AtomicBoolean();
@@ -394,7 +419,7 @@ public final class Partition {
      * 业务作用：在生命周期锁内创建新一代分区槽位，防止半启动状态对 producer 可见。
      *
      * 参数说明: 无。
-     * 返回: 无返回值；所有 worker 就绪后才发布 ACCEPTING 快照。
+     * 返回: 无返回值；所有 worker 与唯一分区观察任务就绪后才发布 ACCEPTING 快照。
      */
     private void startInternal() {
         this.lifecycleLock.lock();
@@ -408,6 +433,9 @@ public final class Partition {
                 // 延迟入口依赖时间轮的取消与到期驱动，启动顺序错误时不能开放一个能力不完整的分区代次。
                 throw new IllegalStateException("TimingWheel must be started before Partition");
             }
+            this.activeStrictControlSources.clear();
+            this.activeMovingAuditSlots.clear();
+            this.nextLoadObservationNanos = System.nanoTime() + LOAD_OBSERVER_INTERVAL_NANOS;
 
             int requested = Integer.getInteger(
                     "nasa.partition.partitions",
@@ -424,15 +452,22 @@ public final class Partition {
                     slots[i] = slot;
                     started++;
                 }
+                this.scheduleObserver();
+                if (!TimingWheel.isStarted()) {
+                    throw new IllegalStateException("TimingWheel stopped while Partition was starting");
+                }
+
+                this.failedPartitionCount.set(0);
+                this.lifecycle.set(new Lifecycle(epoch, LifecyclePhase.ACCEPTING, slots, partitionCount - 1, null));
             } catch (Throwable failure) {
-                // 启动未完整发布时先停掉已创建 worker，避免孤儿 consumer 在后台继续运行。
+                // 唯一观察任务和 worker 必须作为同一启动单元收口，禁止控制能力不完整的半启动代次对外接单。
+                this.cancelObserver();
                 for (int i = 0; i < started; i++) slots[i].requestStop();
                 for (int i = 0; i < started; i++) slots[i].awaitStopped(DEFAULT_STOP_TIMEOUT_MILLIS);
+                this.activeStrictControlSources.clear();
+                this.activeMovingAuditSlots.clear();
                 throw failure;
             }
-
-            this.failedPartitionCount.set(0);
-            this.lifecycle.set(new Lifecycle(epoch, LifecyclePhase.ACCEPTING, slots, partitionCount - 1, null));
         } finally {
             this.lifecycleLock.unlock();
         }
@@ -448,7 +483,10 @@ public final class Partition {
         this.lifecycleLock.lock();
         try {
             Lifecycle current = this.lifecycle.get();
-            if (current.phase == LifecyclePhase.STOPPED) return true;
+            if (current.phase == LifecyclePhase.STOPPED) {
+                this.cancelObserver();
+                return true;
+            }
 
             Lifecycle stopping = current;
             if (current.phase == LifecyclePhase.ACCEPTING) {
@@ -462,6 +500,9 @@ public final class Partition {
                 // 先关闭全局入口，迟到 producer 登记旧代后复验失败，只会退出而不会再发布任务。
                 this.lifecycle.set(stopping);
             }
+
+            // 先关闭全局入口再撤销周期任务；已经开始的回调会在代次复验失败后停止发布控制副作用。
+            this.cancelObserver();
 
             this.rejectDelayedEntries("Partition 停机取消尚未到期任务");
 
@@ -486,10 +527,247 @@ public final class Partition {
                 return false;
             }
 
+            this.activeStrictControlSources.clear();
+            this.activeMovingAuditSlots.clear();
             this.lifecycle.set(Lifecycle.stopped(this.lifecycleEpoch.incrementAndGet()));
             return true;
         } finally {
             this.lifecycleLock.unlock();
+        }
+    }
+
+    /**
+     * 业务作用：从无业务上下文的短生命周期线程登记唯一分区观察任务，避免启动调用方上下文被长期持有。
+     *
+     * 参数说明: 无。
+     * 返回: 无返回值；登记异常会同步传播，调用方不得发布缺少负载观察或控制推进能力的分区代次。
+     */
+    private void scheduleObserver() {
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread registrar = Thread.ofVirtual()
+                .inheritInheritableThreadLocals(false)
+                .name("Virtual-Partition-observer-registrar")
+                .start(() -> {
+                    try {
+                        // 观察器是唯一的进程级高频任务；走 platform 快速通道，避免每个 tick 创建虚拟线程执行载体。
+                        TimingWheel.platform(
+                                OBSERVER_INTERVAL_MILLIS,
+                                OBSERVER_INTERVAL_MILLIS,
+                                OBSERVER_UNIQUE,
+                                OBSERVER_ACTION
+                        );
+                    } catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                });
+
+        boolean interrupted = false;
+        while (registrar.isAlive()) {
+            try {
+                registrar.join();
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+
+        Throwable registrationFailure = failure.get();
+        if (registrationFailure instanceof RuntimeException runtime) throw runtime;
+        if (registrationFailure instanceof Error error) throw error;
+        if (registrationFailure != null) {
+            throw new IllegalStateException("Partition observer registration failed", registrationFailure);
+        }
+    }
+
+    /**
+     * 业务作用：撤销唯一分区观察任务，阻止停机后继续发布窃取请求或推进旧代迁移。
+     *
+     * 参数说明: 无。
+     * 返回: 无返回值；TimingWheel 已停止或任务已经取消时保持幂等。
+     */
+    private void cancelObserver() {
+        if (!TimingWheel.isStarted()) return;
+        TimingWheel.cancel(OBSERVER_UNIQUE);
+    }
+
+    /**
+     * 业务作用：通过唯一 1ms 快速通道推进迁移控制，并按 1 秒节流周期集中观察热点负载。
+     *
+     * 参数说明: 无。
+     * 返回: 无返回值；普通 tick 只检查活动控制状态和观察截止时刻，生命周期变化时不推进旧代状态。
+     */
+    private void advanceObserver() {
+        if (!this.observerRunning.compareAndSet(false, true)) return;
+        try {
+            Lifecycle global = this.lifecycle.get();
+            if (global.phase != LifecyclePhase.ACCEPTING) return;
+            global.inflight.incrementAndGet();
+            try {
+                if (this.lifecycle.get() != global || global.phase != LifecyclePhase.ACCEPTING) return;
+
+                if (!this.activeMovingAuditSlots.isEmpty()) this.wakeMovingAuditors();
+                if (!this.activeStrictControlSources.isEmpty()) {
+                    for (Map.Entry<PartitionSlot, MigrationClaim> active
+                            : this.activeStrictControlSources.entrySet()) {
+                        PartitionSlot source = active.getKey();
+                        if (!source.running
+                                || source.lifecycle.get().phase != SlotPhase.ACCEPTING
+                                || !source.needsStrictControlProgress()) {
+                            // 只摘除本轮实际观察到的声明；并发发布的新 claim 已接管唤醒责任，旧观察者不得覆盖。
+                            this.activeStrictControlSources.remove(source, active.getValue());
+                            continue;
+                        }
+                        // 严格迁移和归还的源侧边界只允许其唯一 worker 推进，观察器只能定向唤醒而不越权代办。
+                        source.wakeWorker();
+                    }
+                }
+
+                long now = System.nanoTime();
+                if (now - this.nextLoadObservationNanos >= 0L) {
+                    this.nextLoadObservationNanos = now + LOAD_OBSERVER_INTERVAL_NANOS;
+                    this.observeLoad(global);
+                }
+            } finally {
+                global.inflight.decrementAndGet();
+            }
+        } finally {
+            this.observerRunning.set(false);
+        }
+    }
+
+    /**
+     * 业务作用：按单次 O(N) 槽位快照选择最繁忙源分区，并为合格空闲目标批量发布窃取请求。
+     *
+     * @param global 已由唯一观察任务登记 inflight 并复验为当前 ACCEPTING 的全局快照
+     * 返回: 无返回值；没有热点时不产生控制副作用，每轮首条成功请求为严格类型保留独立候选机会。
+     */
+    private void observeLoad(Lifecycle global) {
+        int idleThreshold = idleTaskThreshold();
+        PartitionSlot source = null;
+        int highest = idleThreshold;
+        for (PartitionSlot candidate : global.slots) {
+            if (!candidate.running
+                    || candidate.lifecycle.get().phase != SlotPhase.ACCEPTING) continue;
+            int count = candidate.localTaskCount.get();
+            if (count > highest) {
+                highest = count;
+                source = candidate;
+            }
+        }
+        if (source == null) return;
+
+        int maxInboundTunnels = Math.max(
+                1,
+                Integer.getInteger("nasa.partition.max-inbound-tunnels", 4)
+        );
+        boolean requested = false;
+        long observationEpoch = ++this.loadObservationEpoch;
+        int targetStart = ((int) observationEpoch) & global.mask;
+        for (int offset = 0; offset < global.slots.length; offset++) {
+            // 每轮轮转起点，防止固定低槽位的反向盗洞持续吃掉全部严格候选尝试预算。
+            PartitionSlot target = global.slots[(targetStart + offset) & global.mask];
+            if (target == source
+                    || !target.running
+                    || target.lifecycle.get().phase != SlotPhase.ACCEPTING
+                    || target.localTaskCount.get() > idleThreshold
+                    || target.tunnelTaskCount.get() > idleThreshold
+                    || target.inboundNonStrictTunnels.size() >= maxInboundTunnels
+                    || !target.stealRequest.pending.compareAndSet(false, true)) continue;
+            try {
+                target.stealRequest.observationEpoch = observationEpoch;
+                source.controlQueue.offer(target.stealRequest);
+                requested = true;
+            } catch (Throwable failure) {
+                target.stealRequest.observationEpoch = 0L;
+                target.stealRequest.pending.set(false);
+                if (source.controlQueue.isFailed()) {
+                    source.failSlot(
+                            "控制队列永久死槽: " + source.controlQueue.failureIndex(),
+                            failure
+                    );
+                    break;
+                }
+            }
+        }
+        if (requested) source.wakeWorker();
+    }
+
+    /**
+     * 业务作用：把活动 MOVING 条目的审计责任定向交给去重后的责任槽位，隔离业务 Task 所有者回调与时间轮线程。
+     *
+     * 参数说明: 无。
+     * 返回: 无返回值；单轮最多访问每个活动槽位一次，不随 MOVING 条目数量增长。
+     */
+    private void wakeMovingAuditors() {
+        for (PartitionSlot slot : this.activeMovingAuditSlots.keySet()) {
+            if (slot.running) slot.wakeWorker();
+        }
+    }
+
+    /**
+     * 业务作用：登记一条 MOVING 任务涉及的两侧审计槽位，使快速通道无需读取可复用任务条目。
+     *
+     * @param source 当前物理摘除方
+     * @param target 计划接收任务的分区
+     * 返回: 无返回值；同一槽位的多条迁移通过精确引用计数合并为一个活动登记。
+     */
+    private void registerMovingAuditSlots(PartitionSlot source, PartitionSlot target) {
+        this.registerMovingAuditSlot(source);
+        if (target == source) return;
+        try {
+            this.registerMovingAuditSlot(target);
+        } catch (Throwable failure) {
+            this.unregisterMovingAuditSlot(source);
+            throw failure;
+        }
+    }
+
+    /**
+     * 业务作用：增加单个迁移审计槽位的活动引用，并在首条迁移到达时发布给 1ms 快速通道。
+     *
+     * @param slot 需要其唯一 worker 参与迁移审计的槽位
+     * 返回: 无返回值；登记失败会回滚引用计数，调用方不得继续发布 MOVING。
+     */
+    private void registerMovingAuditSlot(PartitionSlot slot) {
+        int previous = slot.movingAuditRegistrations.getAndIncrement();
+        if (previous != 0) return;
+        try {
+            this.activeMovingAuditSlots.put(slot, Boolean.TRUE);
+        } catch (Throwable failure) {
+            slot.movingAuditRegistrations.decrementAndGet();
+            throw failure;
+        }
+    }
+
+    /**
+     * 业务作用：撤销一条 MOVING 任务的两侧审计责任，最后一条结束后停止对应槽位的周期唤醒。
+     *
+     * @param source 当前物理摘除方
+     * @param target 计划接收任务的分区
+     * 返回: 无返回值；并发新登记胜出时会重新发布槽位，不能被迟到摘除覆盖。
+     */
+    private void unregisterMovingAuditSlots(PartitionSlot source, PartitionSlot target) {
+        this.unregisterMovingAuditSlot(source);
+        if (target != source) this.unregisterMovingAuditSlot(target);
+    }
+
+    /**
+     * 业务作用：减少单个迁移审计槽位的活动引用，并在线性化归零后安全撤销快速通道登记。
+     *
+     * @param slot 已结束一条关联迁移的槽位
+     * 返回: 无返回值；引用异常时冻结槽位，避免观察责任在计数损坏后静默丢失。
+     */
+    private void unregisterMovingAuditSlot(PartitionSlot slot) {
+        int remaining = slot.movingAuditRegistrations.decrementAndGet();
+        if (remaining < 0) {
+            slot.failSlot("MOVING 审计槽位引用计数为负数", null);
+            return;
+        }
+        if (remaining != 0) return;
+        this.activeMovingAuditSlots.remove(slot);
+        // 归零与摘除之间若有新迁移登记，重新发布可避免迟到 remove 覆盖新的观察责任。
+        if (slot.movingAuditRegistrations.get() != 0) {
+            this.activeMovingAuditSlots.put(slot, Boolean.TRUE);
         }
     }
 
@@ -1583,6 +1861,8 @@ public final class Partition {
 
         final PartitionSlot target;
         final AtomicBoolean pending = new AtomicBoolean();
+        /** 观察批次代次经队列 release/acquire 发布，供源 worker 合并同轮严格候选尝试。 */
+        volatile long observationEpoch;
 
         /**
          * 业务作用：创建绑定空闲目标分区的可复用控制请求，避免每轮空闲探测分配新对象。
@@ -1614,6 +1894,8 @@ public final class Partition {
         private final ConcurrentLinkedQueue<TaskEntry> failedEvidence = new ConcurrentLinkedQueue<>();
         private final AtomicInteger localTaskCount = new AtomicInteger();
         private final AtomicInteger tunnelTaskCount = new AtomicInteger();
+        /** 当前需要本槽位 worker 参与审计的 MOVING 条目数，用于合并 1ms 唤醒。 */
+        private final AtomicInteger movingAuditRegistrations = new AtomicInteger();
         private final AtomicReference<SlotLifecycle> lifecycle;
         private final AtomicLong lifecycleEpoch = new AtomicLong();
         private final AtomicInteger signal = new AtomicInteger();
@@ -1621,10 +1903,14 @@ public final class Partition {
         private final CountDownLatch stopped = new CountDownLatch(1);
         private final StealRequest stealRequest;
 
+        /** 以下三个字段只由本槽唯一 worker 更新，为同一观察批次提供有界的严格候选接力。 */
+        private long strictOpportunityEpoch = Long.MIN_VALUE;
+        private int strictOpportunityAttempts;
+        private boolean strictOpportunityResolved;
+
         private volatile boolean running;
         private volatile Thread worker;
         private volatile String failureReason;
-        private long nextStealAttemptNanos;
         /**
          * 业务作用：创建一代分区槽位及其唯一主队列，尚未启动 worker 前不对 producer 发布。
          *
@@ -1746,14 +2032,11 @@ public final class Partition {
                 }
             }
 
-            boolean counted = false;
             try {
                 if (!this.prepareEntry(entry, task, typeState, typeState, this.slot, null, null)) return;
-                counted = true;
                 try {
                     this.queue.offer(entry);
                 } catch (Throwable failure) {
-                    if (counted && entry.state() != TaskEntry.CANCELLED) typeState.decrement();
                     entry.rejectQueued("主队列发布失败: " + failure.getClass().getSimpleName());
                     if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                     if (this.queue.isFailed()) {
@@ -1800,7 +2083,6 @@ public final class Partition {
             try {
                 context.stagingQueue.offer(entry);
             } catch (Throwable failure) {
-                if (entry.state() != TaskEntry.CANCELLED) context.decrement();
                 entry.rejectQueued("returnStaging 发布失败: " + failure.getClass().getSimpleName());
                 if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                 if (context.stagingQueue.isFailed()) {
@@ -1835,7 +2117,6 @@ public final class Partition {
             try {
                 tunnel.incrementalQueue.offer(entry);
             } catch (Throwable failure) {
-                if (entry.state() != TaskEntry.CANCELLED) tunnel.decrement();
                 entry.rejectQueued("严格增量队列发布失败: " + failure.getClass().getSimpleName());
                 if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                 if (tunnel.incrementalQueue.isFailed()) {
@@ -1863,7 +2144,6 @@ public final class Partition {
             try {
                 tunnel.queue.offer(entry);
             } catch (Throwable failure) {
-                if (entry.state() != TaskEntry.CANCELLED) tunnel.decrement();
                 entry.rejectQueued("盗洞队列发布失败: " + failure.getClass().getSimpleName());
                 if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                 if (tunnel.queue.isFailed()) {
@@ -1961,7 +2241,6 @@ public final class Partition {
                     }
 
                     if (!progressed) {
-                        this.maybeRequestSteal();
                         this.parkUntilWork();
                     }
                 }
@@ -2008,11 +2287,29 @@ public final class Partition {
                 if (request == null) break;
                 progressed = true;
                 try {
-                    if (!this.installNonStrictTunnel(request.target)) {
-                        // 只有不存在可安装的非严格候选时才考虑严格类型，减少 FIFO 执行权迁移频率。
-                        this.installStrictTunnelFor(request.target);
+                    if (request.observationEpoch != this.strictOpportunityEpoch) {
+                        this.strictOpportunityEpoch = request.observationEpoch;
+                        this.strictOpportunityAttempts = 0;
+                        this.strictOpportunityResolved = false;
+                    }
+                    boolean attemptedStrict = false;
+                    boolean installedStrict = false;
+                    if (!this.strictOpportunityResolved
+                            && this.strictOpportunityAttempts < STRICT_OPPORTUNITY_ATTEMPTS) {
+                        this.strictOpportunityAttempts++;
+                        attemptedStrict = true;
+                        // 首个目标可能因反向盗洞或门禁竞态拒绝；固定三次接力避免槽位序偏置形成整轮饥饿。
+                        installedStrict = this.installStrictTunnelFor(request.target);
+                        if (installedStrict) this.strictOpportunityResolved = true;
+                    }
+                    if (!installedStrict && !this.installNonStrictTunnel(request.target)) {
+                        // 其余目标仍优先走低成本的非严格盗洞，仅在没有候选时迁移严格执行权。
+                        if (!attemptedStrict && this.installStrictTunnelFor(request.target)) {
+                            this.strictOpportunityResolved = true;
+                        }
                     }
                 } finally {
+                    request.observationEpoch = 0L;
                     request.pending.set(false);
                 }
             }
@@ -2124,6 +2421,8 @@ public final class Partition {
 
             StrictRoute migrating = claim.migratingRoute;
             StrictTunnel tunnel = migrating.tunnel;
+            // claim 已关闭旧执行权，先登记源侧快速推进责任；即使声明线程随后暂停，1ms 通道也会唤醒源 worker 帮助完成。
+            this.partition.activeStrictControlSources.put(this, claim);
             StrictRoute current = typeState.strictRoute.get();
             if (current == local) {
                 // 目标登记必须先于路由发布：producer 一旦观察 MIGRATING，就必须已有唯一 consumer
@@ -2178,52 +2477,6 @@ public final class Partition {
                 if (tunnel.source == other && !tunnel.failed.get()) return true;
             }
             return false;
-        }
-
-        /**
-         * 业务作用：空闲时选择本代最繁忙健康分区并提交可复用窃取请求，不直接消费对方主队列。
-         *
-         * 参数说明: 无。
-         * 返回: 无返回值；每个目标同一时刻最多挂起一个申请，并受全局旧代 inflight 保护。
-         */
-        void maybeRequestSteal() {
-            if (this.localTaskCount.get() > idleTaskThreshold()
-                    || this.tunnelTaskCount.get() > idleTaskThreshold()) return;
-            if (this.inboundNonStrictTunnels.size()
-                    >= Math.max(1, Integer.getInteger("nasa.partition.max-inbound-tunnels", 4))) return;
-            long now = System.nanoTime();
-            if (now < this.nextStealAttemptNanos) return;
-            this.nextStealAttemptNanos = now + STEAL_RETRY_NANOS;
-
-            Lifecycle global = this.partition.lifecycle.get();
-            if (global.phase != LifecyclePhase.ACCEPTING) return;
-            global.inflight.incrementAndGet();
-            try {
-                if (this.partition.lifecycle.get() != global || global.phase != LifecyclePhase.ACCEPTING) return;
-                PartitionSlot source = null;
-                int highest = idleTaskThreshold();
-                for (PartitionSlot candidate : global.slots) {
-                    if (candidate == this || candidate.lifecycle.get().phase != SlotPhase.ACCEPTING) continue;
-                    int count = candidate.localTaskCount.get();
-                    if (count > highest) {
-                        highest = count;
-                        source = candidate;
-                    }
-                }
-                if (source == null || !this.stealRequest.pending.compareAndSet(false, true)) return;
-                try {
-                    source.controlQueue.offer(this.stealRequest);
-                } catch (Throwable failure) {
-                    this.stealRequest.pending.set(false);
-                    if (source.controlQueue.isFailed()) {
-                        source.failSlot("控制队列永久死槽: " + source.controlQueue.failureIndex(), failure);
-                    }
-                    return;
-                }
-                source.wakeWorker();
-            } finally {
-                global.inflight.decrementAndGet();
-            }
         }
 
         /**
@@ -2549,6 +2802,13 @@ public final class Partition {
                 return;
             }
             if (!entry.tryStart(this.slot)) {
+                int current = entry.state();
+                if (current == TaskEntry.CANCELLED || current == TaskEntry.REJECTED) {
+                    // 取消可能在初次状态复验与 RUNNING 竞争之间胜出；私有 FIFO 已摘除，可在完整终态后释放。
+                    entry.releaseDroppedTask();
+                    return;
+                }
+                if (current == TaskEntry.FAILED) return;
                 context.tunnel.fail("LOCAL_CATCHUP 在 " + stage + " 无法取得任务执行权", entry);
                 return;
             }
@@ -2944,12 +3204,13 @@ public final class Partition {
                 NonStrictTunnel tunnel,
                 StrictTunnel strictTunnel
         ) {
-            if (entry.state() == TaskEntry.CANCELLED || entry.state() == TaskEntry.REJECTED) {
-                // 当前线程已从对应物理队列摘除终态条目，至此才允许归还业务任务对象。
+            int entryState = entry.state();
+            if (entryState == TaskEntry.CANCELLED || entryState == TaskEntry.REJECTED) {
+                // state() 已等待所有者与计数发布完成；唯一 consumer 物理摘除后才可归还业务任务对象。
                 entry.releaseDroppedTask();
                 return;
             }
-            if (entry.state() == TaskEntry.FAILED) return;
+            if (entryState == TaskEntry.FAILED) return;
             if (entry.nonStrictTunnel != tunnel || entry.strictTunnel != strictTunnel) {
                 this.freezeEntry(entry, "任务物理队列与盗洞登记不一致，sequence=" + sequence);
                 return;
@@ -3194,6 +3455,8 @@ public final class Partition {
                 try {
                     tunnel.stockQueue.offer(entry);
                 } catch (Throwable failure) {
+                    String reason = "严格存量队列发布失败，sourceSequence=" + sequence
+                            + ", failedSequence=" + tunnel.stockQueue.failureIndex();
                     if (entry.state() == TaskEntry.CANCELLED) {
                         // 取消方已经减少目标计数，任务也未进入目标队列；迁移方补减仍保留的源计数。
                         entry.typeState.decrement();
@@ -3203,13 +3466,13 @@ public final class Partition {
                         entry.logicalCounter = entry.typeState;
                         entry.strictTunnel = null;
                         TaskEntry.STATE.setRelease(entry, TaskEntry.QUEUED);
-                        entry.publishOwner(OWNER_FAILED);
                     }
-                    tunnel.fail(
-                            "严格存量队列发布失败，sourceSequence=" + sequence
-                                    + ", failedSequence=" + tunnel.stockQueue.failureIndex(),
-                            entry
-                    );
+                    try {
+                        tunnel.fail(reason, entry);
+                    } finally {
+                        // 盗洞可能已由并发故障置为 failed 并让 fail() 短路；已脱离两侧队列的任务仍须独立发布终态。
+                        if (entry.state() == TaskEntry.QUEUED) this.freezeEntry(entry, reason);
+                    }
                     return;
                 }
 
@@ -3374,6 +3637,26 @@ public final class Partition {
         }
 
         /**
+         * 业务作用：判断本槽位是否持有只能由其唯一 worker 推进的严格声明、迁移或归还状态。
+         *
+         * 参数说明: 无。
+         * 返回: 存在未发布 MigrationClaim 或仍登记目标执行权的严格盗洞时返回 true。
+         */
+        boolean needsStrictControlProgress() {
+            for (TypeState typeState : this.typeStates.values()) {
+                if (!typeState.strictOrder || typeState.failed.get()) continue;
+                StrictRoute route = typeState.strictRoute.get();
+                if (route.state == StrictRouteState.LOCAL
+                        && route.executionGate.get() instanceof MigrationClaim) return true;
+                StrictTunnel tunnel = route.tunnel;
+                if (tunnel != null
+                        && !tunnel.failed.get()
+                        && tunnel.target.inboundStrictTunnels.containsKey(tunnel)) return true;
+            }
+            return false;
+        }
+
+        /**
          * 业务作用：等待本槽位 worker 完成排空或故障退出，给全局生命周期提供停止证明。
          *
          * @param timeoutMillis 最长等待毫秒数
@@ -3412,8 +3695,9 @@ public final class Partition {
                 return;
             }
             if (this.inboundNonStrictTunnels.isEmpty() && this.inboundStrictTunnels.isEmpty()) {
-                // 空闲分区需要周期性醒来重新观察全局负载，否则源分区稍后变忙时不会有业务信号唤醒窃取方。
-                LockSupport.parkNanos(this, STEAL_RETRY_NANOS);
+                // 远端热点由集中观察者发现并发布控制请求；本 worker 无限期休眠可消除每分区定时唤醒，
+                // 本地任务、停机和控制交接仍通过 signal + unpark 保证不会丢失业务推进责任。
+                LockSupport.park(this);
             } else {
                 // 活动租约需要目标 worker 定期醒来续租；定时 park 不依赖新业务任务偶然唤醒。
                 LockSupport.parkNanos(this, Math.max(1L, DEFAULT_TUNNEL_LEASE_NANOS / 4L));
@@ -3483,7 +3767,7 @@ public final class Partition {
     }
 
     /**
-     * 不参与对象池复用的公开提交句柄；串行化同一引用上的访问与释放，阻断跨代 ABA。
+     * 不参与对象池复用的公开提交句柄；每次访问取得独立回收 hold，使慢状态读取不阻塞同一句柄的故障观察。
      */
     private static final class SubmissionHandle implements Submission {
 
@@ -3510,8 +3794,13 @@ public final class Partition {
          * 返回: 本代内部条目的权威公开状态；句柄已经释放或代次失配时抛出 IllegalStateException。
          */
         @Override
-        public synchronized Status status() {
-            return this.activeEntry().submissionStatus();
+        public Status status() {
+            TaskEntry current = this.retainActiveEntry();
+            try {
+                return current.submissionStatus();
+            } finally {
+                current.releaseRecycleHold(this.generation);
+            }
         }
 
         /**
@@ -3521,8 +3810,13 @@ public final class Partition {
          * 返回: 本代任务在执行前成功转为 CANCELLED 时返回 true；其他终态返回 false。
          */
         @Override
-        public synchronized boolean cancel() {
-            return this.activeEntry().cancelSubmission();
+        public boolean cancel() {
+            TaskEntry current = this.retainActiveEntry();
+            try {
+                return current.cancelSubmission();
+            } finally {
+                current.releaseRecycleHold(this.generation);
+            }
         }
 
         /**
@@ -3540,7 +3834,8 @@ public final class Partition {
          * 业务作用：一次性释放调用方对本代条目的外部持有，使物理收口后的内部条目可以安全归池。
          *
          * 参数说明: 无。
-         * 返回: 无返回值；重复释放幂等，释放与同一句柄的状态读取/取消互斥。
+         * 返回: 无返回值；重复释放幂等，新访问与释放门禁互斥，已经取得临时 hold 的状态读取或取消可在
+         * 本方法返回后继续完成且不会穿透到复用后的条目。
          */
         @Override
         public synchronized void recycle() {
@@ -3565,6 +3860,18 @@ public final class Partition {
             }
             return current;
         }
+
+        /**
+         * 业务作用：在句柄释放门禁内取得本代条目并增加临时访问 hold，使后续慢操作可安全移出 monitor。
+         *
+         * 参数说明: 无。
+         * 返回: 本代仍活动的内部条目；并发 close 胜出时抛出 IllegalStateException。
+         */
+        private synchronized TaskEntry retainActiveEntry() {
+            TaskEntry current = this.activeEntry();
+            current.retainRecycleHold();
+            return current;
+        }
     }
 
     /**
@@ -3582,6 +3889,8 @@ public final class Partition {
         static final int FAILED = 7;
         static final int DELAYED = 8;
         static final int RELEASED = 9;
+        /** 终态所有者及其副作用尚未发布完成，任何 consumer 都不得执行或释放业务任务。 */
+        static final int TERMINATING = 10;
 
         private static final VarHandle STATE;
         private static final VarHandle TASK;
@@ -3592,6 +3901,7 @@ public final class Partition {
         private static final VarHandle RECYCLE_HOLDS;
         private static final VarHandle RECYCLE_TOKEN;
         private static final VarHandle RELEASE_REQUESTED;
+        private static final VarHandle TERMINAL_STALL_REPORTED;
 
         static {
             try {
@@ -3617,6 +3927,11 @@ public final class Partition {
                         "moveFailureRecorded",
                         boolean.class
                 );
+                TERMINAL_STALL_REPORTED = lookup.findVarHandle(
+                        TaskEntry.class,
+                        "terminalStallReported",
+                        boolean.class
+                );
             } catch (ReflectiveOperationException failure) {
                 throw new ExceptionInInitializerError(failure);
             }
@@ -3630,6 +3945,7 @@ public final class Partition {
         private volatile boolean moveFailureRecorded;
         private volatile boolean frameworkReleased;
         private volatile boolean releaseRequested;
+        private volatile boolean terminalStallReported;
         private volatile int recycleHolds;
         /** 高位为本对象借出代次，低位 1 表示本代已经提交归池，阻止并发双归还跨越下一次借出。 */
         private volatile long recycleToken;
@@ -3647,6 +3963,7 @@ public final class Partition {
         private volatile long moveStartedNanos;
         private volatile String moveStage;
         private volatile long moveRecycleGeneration = -1L;
+        private boolean moveAuditSlotsRegistered;
         private final ObjectPool.PooledHandle<TaskEntry> handle;
 
         /**
@@ -3675,6 +3992,7 @@ public final class Partition {
             this.recycleHolds = 1;
             this.frameworkReleased = false;
             this.releaseRequested = autoRecycle;
+            this.terminalStallReported = false;
         }
 
         /**
@@ -3794,6 +4112,7 @@ public final class Partition {
             this.moveFailureRecorded = false;
             this.frameworkReleased = false;
             this.releaseRequested = false;
+            this.terminalStallReported = false;
             this.recycleHolds = 0;
             this.keyHash = 0;
             this.delayUnique = null;
@@ -3809,6 +4128,7 @@ public final class Partition {
             this.moveStartedNanos = 0L;
             this.moveStage = null;
             this.moveRecycleGeneration = -1L;
+            this.moveAuditSlotsRegistered = false;
         }
 
         /**
@@ -3858,8 +4178,10 @@ public final class Partition {
          */
         boolean rejectDelayed(String reason) {
             this.rejectionReason = reason;
-            if (!STATE.compareAndSet(this, DELAYED, REJECTED)) return false;
+            if (!STATE.compareAndSet(this, DELAYED, TERMINATING)) return false;
             this.publishOwner(OWNER_REJECTED);
+            // 所有者终态完成后才开放 REJECTED，避免到期回调或释放方清空尚待发布的业务对象。
+            STATE.setRelease(this, REJECTED);
             this.releaseDroppedTask();
             return true;
         }
@@ -3912,13 +4234,52 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：读取内部精确状态，供唯一 consumer 在物理摘除后选择执行、跳过或保留证据。
+         * 业务作用：读取已经完整发布的内部状态，阻止 consumer 越过终态所有者发布窗口释放业务对象。
          *
          * 参数说明: 无。
-         * 返回: 内部状态整数。
+         * 返回: 非 TERMINATING 的内部状态；超过总时限会冻结所属类型并记录一次故障，但不会伪造发布方终态。
          */
         int state() {
-            return (int) STATE.getAcquire(this);
+            int current = (int) STATE.getAcquire(this);
+            long waitStartedNanos = 0L;
+            long waitTimeoutNanos = 0L;
+            while (current == TERMINATING) {
+                if (waitStartedNanos == 0L) {
+                    waitStartedNanos = System.nanoTime();
+                    waitTimeoutNanos = transitionTimeoutNanos();
+                } else if (System.nanoTime() - waitStartedNanos >= waitTimeoutNanos) {
+                    this.reportTerminalStall(System.nanoTime() - waitStartedNanos);
+                }
+                // parkNanos 会消耗调用线程已有的 unpark permit；本方法不得插入 worker 发布 signal 后、
+                // park 前的二次检查窗口，否则会破坏 parkUntilWork 的不丢唤醒证明。
+                LockSupport.parkNanos(this, 1_000L);
+                current = (int) STATE.getAcquire(this);
+            }
+            return current;
+        }
+
+        /**
+         * 业务作用：把长期未完成的终态发布转为可观测类型故障，同时保留原发布者对最终状态的唯一权威。
+         *
+         * @param waitedNanos 本次调用线程已经等待 TERMINATING 收口的时长
+         * 返回: 无返回值；每个条目借出代次最多报告一次，缺少类型归属时只记录错误。
+         */
+        void reportTerminalStall(long waitedNanos) {
+            if (!TERMINAL_STALL_REPORTED.compareAndSet(this, false, true)) return;
+            PartitionSlot origin = this.source;
+            TypeState type = this.typeState;
+            String reason = "任务终态发布超过总时限: waitedMs="
+                    + TimeUnit.NANOSECONDS.toMillis(waitedNanos);
+            if (origin == null || type == null) {
+                log.error("Partition task terminal publication stalled without type ownership: {}", reason);
+                return;
+            }
+            try {
+                // 终态仍由原线程发布；这里只关闭该类型的新路由，避免更多任务进入已失去推进能力的故障域。
+                origin.failType(type, reason, null);
+            } catch (Throwable failure) {
+                log.error("Partition failed to freeze stalled terminal publication", failure);
+            }
         }
 
         /**
@@ -3945,9 +4306,13 @@ public final class Partition {
                 this.moveSequence = sequence;
                 this.moveStartedNanos = System.nanoTime();
                 this.moveFailureRecorded = false;
+                INSTANCE.registerMovingAuditSlots(moveSource, moveTarget);
+                this.moveAuditSlotsRegistered = true;
                 INSTANCE.movingRegistry.put(this, Boolean.TRUE);
                 if (STATE.compareAndSet(this, QUEUED, MOVING)) return true;
                 INSTANCE.movingRegistry.remove(this);
+                INSTANCE.unregisterMovingAuditSlots(moveSource, moveTarget);
+                this.moveAuditSlotsRegistered = false;
                 // ConcurrentHashMap 弱一致迭代器可能已经取得 key；等待旧审计者退出后才能解除移动 hold。
                 INSTANCE.awaitMovingAuditGrace();
                 this.clearMoveDescriptor();
@@ -3956,6 +4321,10 @@ public final class Partition {
                 return false;
             } catch (Throwable failure) {
                 INSTANCE.movingRegistry.remove(this);
+                if (this.moveAuditSlotsRegistered) {
+                    INSTANCE.unregisterMovingAuditSlots(moveSource, moveTarget);
+                    this.moveAuditSlotsRegistered = false;
+                }
                 INSTANCE.awaitMovingAuditGrace();
                 this.clearMoveDescriptor();
                 this.moveRecycleGeneration = -1L;
@@ -3976,14 +4345,20 @@ public final class Partition {
                 while (true) {
                     int current = this.state();
                     if (current != MOVING && current != QUEUED) break;
-                    if (STATE.compareAndSet(this, current, FAILED)) {
+                    if (STATE.compareAndSet(this, current, TERMINATING)) {
                         this.publishOwner(OWNER_FAILED);
+                        // 失败所有者和诊断字段已完成发布，consumer 此后才能把 FAILED 作为稳定证据观察。
+                        STATE.setRelease(this, FAILED);
                         break;
                     }
                 }
             }
             this.moveStartedNanos = 0L;
             INSTANCE.movingRegistry.remove(this);
+            if (this.moveAuditSlotsRegistered) {
+                INSTANCE.unregisterMovingAuditSlots(this.moveSource, this.moveTarget);
+                this.moveAuditSlotsRegistered = false;
+            }
             // 移动 hold 覆盖注册表弱一致读窗口；grace period 后再清字段并开放对象池复用。
             INSTANCE.awaitMovingAuditGrace();
             this.clearMoveDescriptor();
@@ -4003,6 +4378,7 @@ public final class Partition {
             this.moveSequence = -1L;
             this.moveStartedNanos = 0L;
             this.moveStage = null;
+            this.moveAuditSlotsRegistered = false;
         }
 
         /**
@@ -4062,7 +4438,7 @@ public final class Partition {
                 }
                 int remaining = this.logicalCounter.decrement();
                 if (remaining < 0) {
-                    this.source.failType(this.typeState, "任务完成后逻辑计数为负数", this);
+                    this.reportLogicalCounterUnderflow("任务完成后逻辑计数为负数");
                 }
                 STATE.setRelease(this, COMPLETED);
                 this.releaseContext();
@@ -4078,8 +4454,9 @@ public final class Partition {
          */
         void reject(String reason) {
             this.rejectionReason = reason;
-            if (STATE.compareAndSet(this, ENQUEUEING, REJECTED)) {
+            if (STATE.compareAndSet(this, ENQUEUEING, TERMINATING)) {
                 this.publishOwner(OWNER_REJECTED);
+                STATE.setRelease(this, REJECTED);
                 this.releaseDroppedTask();
             }
         }
@@ -4088,12 +4465,17 @@ public final class Partition {
          * 业务作用：回滚已经增加逻辑计数但未成功进入主队列的任务，发布拒绝后禁止 consumer 执行。
          *
          * @param reason 队列发布失败原因
-         * 返回: 无返回值；只允许 QUEUED 到 REJECTED 的提交异常路径成功。
+         * 返回: 无返回值；只有 QUEUED 终态竞争胜出者减少逻辑计数并发布 REJECTED。
          */
         void rejectQueued(String reason) {
             this.rejectionReason = reason;
-            if (STATE.compareAndSet(this, QUEUED, REJECTED)) {
+            if (STATE.compareAndSet(this, QUEUED, TERMINATING)) {
                 this.publishOwner(OWNER_REJECTED);
+                int remaining = this.logicalCounter.decrement();
+                if (remaining < 0) {
+                    this.reportLogicalCounterUnderflow("任务拒绝后逻辑计数为负数");
+                }
+                STATE.setRelease(this, REJECTED);
                 this.releaseDroppedTask();
             }
         }
@@ -4106,8 +4488,9 @@ public final class Partition {
          */
         boolean publishFailed(String reason) {
             this.rejectionReason = reason;
-            if (!STATE.compareAndSet(this, QUEUED, FAILED)) return false;
+            if (!STATE.compareAndSet(this, QUEUED, TERMINATING)) return false;
             this.publishOwner(OWNER_FAILED);
+            STATE.setRelease(this, FAILED);
             return true;
         }
 
@@ -4139,24 +4522,52 @@ public final class Partition {
          * 返回: 本次 CAS 成功并完成逻辑取消时返回 true；此方法不证明队列已经物理摘除。
          */
         boolean cancelQueued() {
-            if (!STATE.compareAndSet(this, QUEUED, CANCELLED)) return false;
+            if (!STATE.compareAndSet(this, QUEUED, TERMINATING)) return false;
             this.publishOwner(OWNER_CANCELLED);
             int remaining = this.logicalCounter.decrement();
             if (remaining < 0) {
-                this.source.failType(this.typeState, "任务取消后逻辑计数为负数", this);
+                this.reportLogicalCounterUnderflow("任务取消后逻辑计数为负数");
             }
+            // CANCELLED 是释放门禁；所有者与逻辑计数都收口后才允许物理 consumer 观察终态。
+            STATE.setRelease(this, CANCELLED);
             return true;
+        }
+
+        /**
+         * 业务作用：在任务计数不变量破坏时冻结所属类型，并避免把正在发布其它终态的同一条目误作 FAILED 证据。
+         *
+         * @param reason 已包含具体终态阶段的稳定故障原因
+         * 返回: 无返回值；故障收口异常只记录，不能阻断当前任务发布其真实终态。
+         */
+        void reportLogicalCounterUnderflow(String reason) {
+            PartitionSlot origin = this.source;
+            TypeState type = this.typeState;
+            if (origin == null || type == null) {
+                log.error("Partition logical counter underflow without type ownership: {}", reason);
+                return;
+            }
+            try {
+                // 当前条目处于 RUNNING 或 TERMINATING，无法合法竞争 QUEUED -> FAILED，故不能充当 failedEvidence。
+                origin.failType(type, reason, null);
+            } catch (Throwable failure) {
+                log.error("Partition failed to close type after logical counter underflow: {}", reason, failure);
+            }
         }
 
         /**
          * 业务作用：安全发布任务所有权终态；业务任务实现异常不能阻断框架计数和资源收口。
          *
          * @param owner 框架终态哨兵
-         * 返回: 无返回值；任务已经释放时直接返回。
+         * 返回: 无返回值；业务任务引用异常缺失时记录错误，调用方仍须发布稳定框架终态。
          */
         void publishOwner(int owner) {
             Task currentTask = this.task();
-            if (currentTask == null) return;
+            if (currentTask == null) {
+                log.error("Partition task owner publication lost task reference: owner={}, state={}",
+                        owner,
+                        STATE.getAcquire(this));
+                return;
+            }
             try {
                 currentTask.setOwner(owner);
             } catch (Throwable failure) {
@@ -4221,12 +4632,19 @@ public final class Partition {
         boolean cancelSubmission() {
             int current = this.state();
             if (current == DELAYED) {
-                if (!STATE.compareAndSet(this, DELAYED, CANCELLED)) return false;
-                INSTANCE.delayedRegistry.remove(this);
-                String unique = this.delayUnique;
-                if (unique != null && TimingWheel.isStarted()) TimingWheel.cancel(unique);
+                if (!STATE.compareAndSet(this, DELAYED, TERMINATING)) return false;
                 this.publishOwner(OWNER_CANCELLED);
-                this.releaseDroppedTask();
+                // DELAYED 到期只能从原状态竞争 ENQUEUEING；先开放完整终态即可关闭执行权，再做外部索引清理。
+                STATE.setRelease(this, CANCELLED);
+                try {
+                    INSTANCE.delayedRegistry.remove(this);
+                    String unique = this.delayUnique;
+                    if (unique != null && TimingWheel.isStarted()) TimingWheel.cancel(unique);
+                } catch (Throwable failure) {
+                    log.error("Partition failed to clean cancelled delayed registration", failure);
+                } finally {
+                    this.releaseDroppedTask();
+                }
                 return true;
             }
             if (current == ENQUEUEING) return this.requestCancelDuringMove();

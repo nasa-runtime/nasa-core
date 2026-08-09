@@ -9,3 +9,4 @@ target/
 *.log
 hs_err_pid*
 dependency-reduced-pom.xml
+tests/

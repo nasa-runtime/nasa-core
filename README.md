@@ -8,7 +8,7 @@
 <dependency>
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-core</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
 </dependency>
 ```
 
@@ -20,7 +20,7 @@
 
 ### Partition —— 按 key 路由的分区任务执行器，带任务窃取
 
-把任务按业务 key 哈希到固定原始分区，每个分区一条 worker 独占消费自己的 MPSC 队列。严格任务在“原始分区 + taskType”边界内维持 FIFO；非严格任务允许经多个盗洞并行分发和任务粒度重排，因此不能把“同 key”一概理解为串行执行。分区空闲时会向繁忙分区安装“盗洞”窃取任务，缓解负载倾斜。
+把任务按业务 key 哈希到固定原始分区，每个分区一条 worker 独占消费自己的 MPSC 队列。严格任务在“原始分区 + taskType”边界内维持 FIFO；非严格任务允许经多个盗洞并行分发和任务粒度重排，因此不能把“同 key”一概理解为串行执行。空闲 worker 由任务发布直接唤醒，不做周期性全局扫描；唯一的 TimingWheel 1ms 分区观察任务持续调度活动迁移审计并定向唤醒责任 worker，其中每秒执行一次集中热点扫描并安装“盗洞”。
 
 ```java
 // Partition 的延迟提交与归还收口依赖 TimingWheel，必须先启动时间轮。
@@ -48,19 +48,19 @@ TimingWheel.of().stop();
 每次提交都必须使用独立的 `Task` 实例；任务对象承载本次提交的所有权状态，入队后不得并发复用或再次提交。
 `taskType()` 必须在任务生命周期内保持稳定，并且同一 `taskType` 不能混用不同的 `strictOrder()` 值；
 `getOwner()`、`setOwner()` 和 `compareAndSetOwner()` 必须提供线程安全的所有权读写与 CAS，所有权字段由框架管理，业务代码不得并发修改。
+这些所有权方法位于调度与终态发布热路径，必须有界且无阻塞，不得执行 I/O、访问外部服务或等待业务锁。
 
 业务任务实现 `Partition.Task`，其中 `strictOrder()` 决定该任务类型是否要求严格保序：
 
 - **严格保序类型**在被窃取、归还的全过程中维持 FIFO。归还走 `RETURN_PREPARE → RETURNING → LOCAL_CATCHUP` 的状态机，配合 `tunnelBoundary`/`localBoundary`/`stagingBoundary` 三个边界保证不倒挂、不重复。
 - **非严格类型**使用租约式盗洞，到期自动失效，窃取路径更短。
 
-窃取哪个任务类别由**被窃取方的 worker** 依据自己队列各类别的统计数决定，而不是由窃取方猜测。
+窃取哪个任务类别由**被窃取方的 worker** 依据自己队列各类别的统计数决定，而不是由窃取方猜测。每轮集中观察为严格候选保留一次独立机会，并在固定数量的轮转目标间接力尝试，防止非严格背景流量或固定目标拒绝使严格热点长期得不到分担；其余请求优先安装非严格盗洞，只有没有合格候选时才迁移严格类型，以限制严格 FIFO 执行权的搬迁频率。
 
-`Submission` 实现 `AutoCloseable`。它是不池化的轻量句柄，与内部池化条目按借出代次绑定：句柄释放后再访问会 `IllegalStateException` 快速失败，而不会读到复用后另一笔任务的状态。
+`Submission` 实现 `AutoCloseable`。它是不池化的轻量句柄，与内部池化条目按借出代次绑定：句柄释放后再访问会 `IllegalStateException` 快速失败，而不会读到复用后另一笔任务的状态。`status()` 和 `cancel()` 不是无阻塞 API；并发终态仍在发布业务所有权时会等待完整收口，超过迁移总时限会冻结所属类型并记录故障，但不会返回猜测状态。
 
 可调系统属性：`nasa.partition.partitions`（分区数，默认为 CPU 核数的 2 倍再向上取到 2 的幂）、`nasa.partition.idle-task-threshold`、`nasa.partition.max-inbound-tunnels`、`nasa.partition.return-observations`、`nasa.partition.stop-timeout-ms`、`nasa.partition.transition-timeout-ms`。
-
-> 稳定性：30 分钟持续压测 9,729 万笔任务（含数据偏移轮转、3,528 次盗洞完整循环、延迟提交与并发取消），账目精确闭合（执行 + 取消 + 拒绝 = 提交，差 0），重复执行 0、严格顺序倒挂 0、异常 0。
+分区观察任务的 1ms 调度周期与其中热点扫描的 1s 节流周期是固定架构参数，不提供系统属性调整。
 
 ### TimingWheel —— 分层时间轮，稳态热路径无锁提交
 

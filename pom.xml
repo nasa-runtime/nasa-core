@@ -6,7 +6,7 @@
 
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-core</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <packaging>jar</packaging>
 
     <name>nasa-core</name>
@@ -52,7 +52,7 @@
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-        <project.build.outputTimestamp>2026-08-05T00:00:00Z</project.build.outputTimestamp>
+        <project.build.outputTimestamp>2026-08-09T00:00:00Z</project.build.outputTimestamp>
 
         <commons-codec.version>1.19.0</commons-codec.version>
         <fastjson2.version>2.0.59</fastjson2.version>
@@ -155,9 +155,8 @@
                                     <files>
                                         <file>${project.basedir}/src/test</file>
                                         <file>${project.basedir}/test</file>
-                                        <file>${project.basedir}/tests</file>
                                     </files>
-                                    <message>nasa-core 仓库禁止包含测试源码或测试目录；请在仓库外执行黑盒回归和长稳压测。</message>
+                                    <message>nasa-core 产品源码树禁止包含测试源码目录；根级本地质量工程不得进入公开仓库或产品归档。</message>
                                 </requireFilesDontExist>
                             </rules>
                         </configuration>

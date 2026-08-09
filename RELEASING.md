@@ -11,7 +11,8 @@
 - Git 工作区干净，`pom.xml`、README 和变更记录中的版本一致。
 - `CHANGELOG.md` 中本次版本已经从“未发布”切换为实际发布日期。
 - 当前提交已推送到 `https://github.com/nasa-runtime/nasa-core`。
-- 仓库不含测试源码以及 `src/test`、`test`、`tests` 目录；发布验收使用仓库外黑盒探针，结果必须由人工确认账目、顺序、停机和异常记录均符合预期。
+- 公开提交和发布归档不含 `src/test`、`test` 或根级 `tests/`；根级 `tests/` 即使在本机存在，也必须
+  保持被 `.gitignore` 排除且 `git ls-files tests` 结果为空。
 
 Central 凭证放在用户级 `~/.m2/settings.xml`，不要写入项目：
 
@@ -47,13 +48,14 @@ Central Portal 的 DNS TXT 流程证明对根域名 `nasa.com` 的控制权，�
 mvn -B -ntp clean verify
 ```
 
-基础构建中的 Maven Enforcer 会拒绝仓库内出现测试目录，防止发布提交绕过上述边界。
+基础构建中的 Maven Enforcer 会拒绝产品源码树出现 `src/test` 或 `test`。根级 `tests/` 属仅本地使用的
+质量工程，不参与 Maven 构建、公开提交或产品归档。
 
 `target/` 中必须至少存在：
 
-- `nasa-core-1.0.0.jar`
-- `nasa-core-1.0.0-sources.jar`
-- `nasa-core-1.0.0-javadoc.jar`
+- `nasa-core-1.0.1.jar`
+- `nasa-core-1.0.1-sources.jar`
+- `nasa-core-1.0.1-javadoc.jar`
 
 同时核对主 JAR 不含本机元数据，POM 不含快照依赖，编译字节码版本为 Java 21。
 
@@ -70,8 +72,8 @@ mvn -B -ntp -Pcentral-release clean deploy
 Central deployment 验证通过后，在当前构建提交上创建并推送与 POM `<scm><tag>` 一致的签名标签：
 
 ```bash
-git tag -s v1.0.0 -m "nasa-core 1.0.0"
-git push origin v1.0.0
+git tag -s v1.0.1 -m "nasa-core 1.0.1"
+git push origin v1.0.1
 ```
 
-确认远端标签准确指向本次构建提交且仓库仍然干净，然后回到 Central Portal 手动点击 Publish。Central 发布成功后在 GitHub 创建 `v1.0.0` Release，发布说明以 `CHANGELOG.md` 对应版本为准。不要把本机签名私钥、Central Token 或用户级 Maven 配置作为附件上传。
+确认远端标签准确指向本次构建提交且仓库仍然干净，然后回到 Central Portal 手动点击 Publish。Central 发布成功后在 GitHub 创建 `v1.0.1` Release，发布说明以 `CHANGELOG.md` 对应版本为准。不要把本机签名私钥、Central Token 或用户级 Maven 配置作为附件上传。
