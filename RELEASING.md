@@ -53,9 +53,9 @@ mvn -B -ntp clean verify
 
 `target/` 中必须至少存在：
 
-- `nasa-core-1.0.1.jar`
-- `nasa-core-1.0.1-sources.jar`
-- `nasa-core-1.0.1-javadoc.jar`
+- `nasa-core-1.0.2.jar`
+- `nasa-core-1.0.2-sources.jar`
+- `nasa-core-1.0.2-javadoc.jar`
 
 同时核对主 JAR 不含本机元数据，POM 不含快照依赖，编译字节码版本为 Java 21。
 
@@ -72,8 +72,8 @@ mvn -B -ntp -Pcentral-release clean deploy
 Central deployment 验证通过后，在当前构建提交上创建并推送与 POM `<scm><tag>` 一致的签名标签：
 
 ```bash
-git tag -s v1.0.1 -m "nasa-core 1.0.1"
-git push origin v1.0.1
+git tag -s v1.0.2 -m "nasa-core 1.0.2"
+git push origin v1.0.2
 ```
 
-确认远端标签准确指向本次构建提交且仓库仍然干净，然后回到 Central Portal 手动点击 Publish。Central 发布成功后在 GitHub 创建 `v1.0.1` Release，发布说明以 `CHANGELOG.md` 对应版本为准。不要把本机签名私钥、Central Token 或用户级 Maven 配置作为附件上传。
+确认远端标签准确指向本次构建提交且仓库仍然干净，然后回到 Central Portal 点击 Publish；Portal 页面不可用时，也可以使用同一 User Token 调用官方 `POST /api/v1/publisher/deployment/<deploymentId>` 接口。Central 发布成功后在 GitHub 创建 `v1.0.2` Release，发布说明以 `CHANGELOG.md` 对应版本为准。不要把本机签名私钥、Central Token 或用户级 Maven 配置作为附件上传。

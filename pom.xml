@@ -6,11 +6,11 @@
 
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-core</artifactId>
-    <version>1.0.1</version>
+    <version>1.0.2</version>
     <packaging>jar</packaging>
 
     <name>nasa-core</name>
-    <description>Nasa Runtime 的纯 Java 基础类型、并发组件与通用工具库</description>
+    <description>Nasa Runtime 的纯 Java 高吞吐并发运行时、对象池、时间轮与雪花 ID 基础库</description>
     <url>https://github.com/nasa-runtime/nasa-core</url>
     <inceptionYear>2026</inceptionYear>
 
@@ -52,7 +52,7 @@
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-        <project.build.outputTimestamp>2026-08-09T00:00:00Z</project.build.outputTimestamp>
+        <project.build.outputTimestamp>2026-08-14T00:00:00Z</project.build.outputTimestamp>
 
         <commons-codec.version>1.19.0</commons-codec.version>
         <fastjson2.version>2.0.59</fastjson2.version>
@@ -128,6 +128,8 @@
                     <include>LICENSE</include>
                     <include>LICENSE-APACHE</include>
                     <include>LICENSE-MIT</include>
+                    <include>README.md</include>
+                    <include>CHANGELOG.md</include>
                 </includes>
             </resource>
         </resources>

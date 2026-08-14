@@ -1,6 +1,6 @@
 # nasa-core
 
-面向高吞吐、低 GC 场景的纯 Java 运行时基础库。核心是三块自研的运行时设施——**分区任务窃取执行器 `Partition`**、**分层时间轮 `TimingWheel`** 和**堆内对象池 `ObjectPool`**——以及围绕它们的无锁并发容器、可回收集合与协议编解码能力。
+面向高吞吐、低 GC 场景的纯 Java 运行时基础库。核心是三块自研的运行时设施——**分区任务窃取执行器 `Partition`**、**分层时间轮 `TimingWheel`** 和**堆内对象池 `ObjectPool`**——以及围绕它们的无锁并发容器、可回收集合、雪花 ID 与协议编解码能力。
 
 不依赖任何容器或框架，不继承外部 parent POM，日志只依赖 `slf4j-api`。
 
@@ -8,7 +8,7 @@
 <dependency>
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-core</artifactId>
-    <version>1.0.1</version>
+    <version>1.0.2</version>
 </dependency>
 ```
 
@@ -111,6 +111,27 @@ final class MyObj implements ObjectPool.Recycler<MyObj> {
 `PooledHandle` 标注了 `@JsonIgnoreType`，Jackson 序列化时按类型跳过，实现类无需逐个加 `@JsonIgnore`（不跳过会因 `handle → pool → 池内其它对象 → handle` 递归而撞 Jackson 嵌套深度上限）。
 
 各内建池容量均可通过 `nasa.object-pool.*` 系统属性调节，例如 `nasa.object-pool.partition-task-entry-capacity`、`nasa.object-pool.timing-wheel-task-capacity`、`nasa.object-pool.recycle-linked-map-capacity`。
+
+### JdkSnowflake —— 纯 JDK 雪花 ID 生成内核
+
+`JdkSnowflake` 把雪花算法与节点协调解耦：core 只负责相对时间戳、workerId 和毫秒内序列号的位布局与并发生成，调用方可以直接使用已经分配好的 workerId，不需要为 ID 热路径引入 Spring 或 Redis。
+
+```java
+long baseTime = 1704038400000L; // 2024-01-01 00:00:00 UTC
+JdkSnowflake ids = new JdkSnowflake(
+        3,        // 当前实例独占的 workerId
+        baseTime,
+        6,        // 最多 64 个 workerId
+        6         // 每个相对毫秒最多 64 个 ID
+);
+
+long id = ids.generate();
+long[] batch = ids.generate(1_000); // 一次加锁完成批量生成
+```
+
+全局唯一性的安全边界是：同一数据域中的并行实例必须使用互不相同的 workerId，并保持一致的 `baseTime`、`workerIdBits` 和 `seqBits`。实例内结果严格递增；跨实例只大致有序，不能据此判定分布式事件的真实先后。时钟回拨或当前毫秒序列耗尽时会向未来借用时间戳，不等待墙上时钟追平。
+
+本类不分配、续租或回收 workerId，也不提供集群成员发现；这些职责应由 Redis 等集成层承担。构造参数越界会立即抛出 `IllegalArgumentException`。生成器没有后台线程或内建指标，运行方应观测 workerId 分配系统，并保留最终存储的唯一约束作为冲突门禁。
 
 ---
 
