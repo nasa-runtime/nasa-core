@@ -1,6 +1,7 @@
 package io.github.nasaruntime.core.base;
 
 import io.github.nasaruntime.core.concurrent.MPSCLinkedQueue;
+import io.github.nasaruntime.core.config.Graceful;
 import io.github.nasaruntime.core.function.Action;
 import io.github.nasaruntime.core.function.ActionRecycler;
 import lombok.extern.slf4j.Slf4j;
@@ -28,8 +29,10 @@ import java.util.function.Consumer;
  * <p>本类拥有固定分区路由、MPSC 队列、唯一 consumer worker、集中负载观察者、任务类型策略、
  * 精确逻辑计数、取消和故障门禁。路由 key 只决定原始分区；严格顺序边界是“原始分区 + 任务类型”。
  * 非严格任务可经多盗洞分发，严格任务通过代次门禁完成整体迁移和有界归还；延迟入口只负责到期后
- * 重新进入当前路由，不预占任何分区负载。</p>
+ * 重新进入当前路由，不预占任何分区负载。每个 Runner 独立持有 worker、队列、对象池与健康状态；
+ * 任务失去安全推进条件时由物理所有权状态机串行发布 FAILED、资源收口和内部条目归池。</p>
  */
+@SuppressWarnings("all")
 @Slf4j
 public final class Partition {
 
@@ -44,7 +47,7 @@ public final class Partition {
 
         /**
          * 业务作用：返回稳定的业务任务类型，作为严格顺序、类型统计和盗洞路由的索引。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 任务进入分区架构后保持不变的类型标识。
          */
@@ -52,7 +55,7 @@ public final class Partition {
 
         /**
          * 业务作用：声明该类型是否要求在“原始分区 + 任务类型”范围内严格 FIFO。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 要求严格保序时返回 true；允许任务粒度重排和多盗洞分发时返回 false。
          */
@@ -60,7 +63,7 @@ public final class Partition {
 
         /**
          * 业务作用：以 acquire 语义读取任务当前逻辑所有者，供执行、取消和迁移竞争时复验权威。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 当前所有权分区号或框架定义的不可执行终态哨兵。
          */
@@ -70,7 +73,7 @@ public final class Partition {
          * 业务作用：在任务初始化或框架已经独占状态迁移权时发布所有者，禁止业务代码并发改写。
          *
          * @param owner 新所有权分区号或框架终态哨兵
-         * 返回: 无返回值；实现必须以 release 或更强语义发布。
+         *              返回: 无返回值；实现必须以 release 或更强语义发布。
          */
         void setOwner(int owner);
 
@@ -78,14 +81,14 @@ public final class Partition {
          * 业务作用：原子转移任务所有权，使执行、取消和跨队列迁移至多只有一方取得权威。
          *
          * @param expectedOwner 期望的当前所有者
-         * @param newOwner 竞争成功后发布的新所有者
-         * 返回: CAS 成功时返回 true；所有权已经被其他路径改变时返回 false。
+         * @param newOwner      竞争成功后发布的新所有者
+         *                      返回: CAS 成功时返回 true；所有权已经被其他路径改变时返回 false。
          */
         boolean compareAndSetOwner(int expectedOwner, int newOwner);
 
         /**
          * 业务作用：执行已经取得唯一执行权的业务任务；框架负责在 finally 中发布终态和减少逻辑计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；业务异常由分区 worker 隔离并记录，不得杀死 worker。
          */
@@ -108,29 +111,47 @@ public final class Partition {
          * 提交生命周期的公开状态。
          */
         enum Status {
-            /** 任务只登记在 TimingWheel，尚未取得任何分区所有权。 */
+            /**
+             * 任务只登记在 TimingWheel，尚未取得任何分区所有权。
+             */
             DELAYED,
-            /** 框架正在完成初始化或路由，尚未形成对外受理结果。 */
+            /**
+             * 框架正在完成初始化或路由，尚未形成对外受理结果。
+             */
             ENQUEUEING,
-            /** 任务已经进入唯一队列并等待执行。 */
+            /**
+             * 任务已经进入唯一队列并等待执行。
+             */
             QUEUED,
-            /** 任务已经取得执行权。 */
+            /**
+             * 任务已经取得执行权。
+             */
             RUNNING,
-            /** 任务已经执行结束。 */
+            /**
+             * 任务已经执行结束。
+             */
             COMPLETED,
-            /** 任务在开始执行前被取消。 */
+            /**
+             * 任务在开始执行前被取消。
+             */
             CANCELLED,
-            /** 任务未被队列受理或因故障/停机被明确拒绝。 */
+            /**
+             * 任务未被队列受理或因故障/停机被明确拒绝。
+             */
             REJECTED,
-            /** 任务已经受理，但所属类型或分区失去安全推进条件，任务作为未执行证据保留。 */
+            /**
+             * 任务已经受理，但所属类型或分区失去安全推进条件；句柄保留未执行终态和稳定原因。
+             */
             FAILED,
-            /** 任务正在两个逻辑所有者之间迁移。 */
+            /**
+             * 任务正在两个逻辑所有者之间迁移。
+             */
             MOVING
         }
 
         /**
          * 业务作用：读取提交当前生命周期，供调用方判断任务是否仍可能执行。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 当前完整发布的权威状态；终态发布尚未收口时等待，句柄已释放时抛出 IllegalStateException。
          */
@@ -138,7 +159,7 @@ public final class Partition {
 
         /**
          * 业务作用：在任务开始执行前竞争取消权；成功者负责发布终态并只减少一次逻辑计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本次调用成功把未执行任务取消时返回 true；任务已运行、完成、拒绝或已被取消时返回 false；
          * 并发终态发布或业务所有权回调未完成时可能等待。
@@ -147,7 +168,7 @@ public final class Partition {
 
         /**
          * 业务作用：返回拒绝或冻结原因，帮助调用方区分停机、类型策略冲突、分区故障和发布异常。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 状态为 REJECTED/FAILED 时返回稳定原因；其他状态通常返回 null。
          */
@@ -155,7 +176,7 @@ public final class Partition {
 
         /**
          * 业务作用：声明调用方不再访问本提交句柄，使内部条目在物理脱离全部容器后可以安全归池。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；可在任务执行前调用，实际归池会延迟到终态、队列摘除和定时包装释放全部完成；
          * 忘记调用会使本笔内部条目失去对象池复用机会。
@@ -164,7 +185,7 @@ public final class Partition {
 
         /**
          * 业务作用：以 try-with-resources 语义释放稳定提交句柄，统一进入对象池延迟回收协议。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；调用后不得继续读取状态、取消或拒绝原因。
          */
@@ -174,92 +195,184 @@ public final class Partition {
         }
     }
 
-    /** 任务已经取消，不再属于任何可执行分区。 */
+    /**
+     * 任务已经取消，不再属于任何可执行分区。
+     */
     public static final int OWNER_CANCELLED = -1;
-    /** 任务已经执行完成，不再属于任何可执行分区。 */
+    /**
+     * 任务已经执行完成，不再属于任何可执行分区。
+     */
     public static final int OWNER_COMPLETED = -2;
-    /** 任务未被框架受理。 */
+    /**
+     * 任务未被框架受理。
+     */
     public static final int OWNER_REJECTED = -3;
-    /** 归还暂存任务使用的不可执行所有权哨兵。 */
+    /**
+     * 归还暂存任务使用的不可执行所有权哨兵。
+     */
     public static final int OWNER_RETURN_STAGING = -4;
-    /** 已受理任务因控制面故障冻结并保留证据。 */
+    /**
+     * 已受理任务因控制面故障冻结，业务任务不再获得执行权。
+     */
     public static final int OWNER_FAILED = -5;
 
     private static final int DEFAULT_DRAIN_BATCH = 1_024;
     private static final long DEFAULT_STOP_TIMEOUT_MILLIS = 5_000L;
     private static final long DEFAULT_TUNNEL_LEASE_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
-    /** 集中负载观察的内部节流周期；盗洞扩容不承担普通任务的低延迟唤醒职责。 */
+    /**
+     * 集中负载观察的内部节流周期；盗洞扩容不承担普通任务的低延迟唤醒职责。
+     */
     private static final long LOAD_OBSERVER_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1L);
-    /** 分区观察任务进入 TimingWheel 1ms 快速通道所用的唯一周期。 */
+    /**
+     * 分区观察任务进入 TimingWheel 1ms 快速通道所用的唯一周期。
+     */
     private static final long OBSERVER_INTERVAL_MILLIS = 1L;
-    /** 单个热点观察批次为严格候选尝试的目标上限，避免首个目标瞬态拒绝后整轮丢失机会。 */
+    /**
+     * 单个热点观察批次为严格候选尝试的目标上限，避免首个目标瞬态拒绝后整轮丢失机会。
+     */
     private static final int STRICT_OPPORTUNITY_ATTEMPTS = 3;
-    /** 停机排空期间无进度时的 park 时长：停机路径不会有新任务到达，忙循环只会空烧 CPU。 */
+    /**
+     * 停机排空期间无进度时的 park 时长：停机路径不会有新任务到达，忙循环只会空烧 CPU。
+     */
     private static final long STOP_DRAIN_PARK_NANOS = TimeUnit.MILLISECONDS.toNanos(1L);
     private static final Object GATE_IDLE = new Object();
     private static final Object GATE_RUNNING = new Object();
-    private static final Partition INSTANCE = new Partition();
-    /** 进程内实例后缀隔离 TimingWheel 的公开 unique 命名空间，避免取消同名业务任务。 */
-    private static final String OBSERVER_UNIQUE = Partition.class.getName()
-            + ".observer@" + Integer.toHexString(System.identityHashCode(INSTANCE));
-    /** 分区观察动作只创建一次，由 TimingWheel 快速通道复用。 */
-    private static final Action OBSERVER_ACTION = INSTANCE::advanceObserver;
-    /** 延迟到期动作使用无捕获策略，逐笔参数放入池化 ActionRecycler 槽位。 */
+    /**
+     * 静态兼容入口统一使用的保留 Runner 名称。
+     */
+    public static final String DEFAULT_RUNNER = TimingWheel.DEFAULT_RUNNER;
+    /**
+     * Runner 注册表按应用级稳定名称隔离分区、队列、背压和健康状态。
+     */
+    private static final ConcurrentHashMap<String, PartitionRunner> RUNNERS = new ConcurrentHashMap<>();
+    /**
+     * 延迟到期动作使用无捕获策略，逐笔参数放入池化 ActionRecycler 槽位。
+     */
     private static final Consumer<ActionRecycler> DELAYED_EXPIRY_ACTION = Partition::runDelayedExpiryAction;
 
+    static {
+        // Partition 的延迟与观察控制依赖 TimingWheel，进程停机必须先关闭分区入口和 worker。
+        Graceful.registry(Integer.MAX_VALUE - 1, Partition::shutdownAll);
+    }
+
+    private final String runnerName;
+    private final TimingWheel.TimingWheelRunner timingWheel;
+    /**
+     * 观察任务只需在绑定时间轮内唯一，名称同时携带 Runner 便于诊断。
+     */
+    private final String observerUnique;
+    /**
+     * 每个 Runner 独立复用自己的观察动作，不允许回调落入 default 分区实例。
+     */
+    private final Action observerAction;
     private final ReentrantLock lifecycleLock = new ReentrantLock();
     private final AtomicLong lifecycleEpoch = new AtomicLong();
     private final AtomicReference<Lifecycle> lifecycle = new AtomicReference<>(Lifecycle.stopped(0L));
     private final AtomicInteger failedPartitionCount = new AtomicInteger();
     private final AtomicLong delayedSequence = new AtomicLong();
-    /** 阻止旧代快速通道回调与当前观察任务并发处理不同代次。 */
+    /**
+     * 阻止旧代快速通道回调与当前观察任务并发处理不同代次。
+     */
     private final AtomicBoolean observerRunning = new AtomicBoolean();
-    /** 下一次允许执行 O(N) 热点扫描的单调时钟时刻，由唯一观察任务更新。 */
+    /**
+     * 观察任务登记时的时间轮启动代次；不匹配说明绑定时间轮曾停机并清除了控制任务。
+     */
+    private volatile long observerTimingWheelEpoch;
+    /**
+     * 下一次允许执行 O(N) 热点扫描的单调时钟时刻，由唯一观察任务更新。
+     */
     private volatile long nextLoadObservationNanos;
-    /** 唯一负载观察者发布的批次代次，使源 worker 能在固定预算内跨目标接力严格候选机会。 */
+    /**
+     * 唯一负载观察者发布的批次代次，使源 worker 能在固定预算内跨目标接力严格候选机会。
+     */
     private long loadObservationEpoch;
-    /** 只登记存在严格迁移或归还状态的源槽及其最新声明，避免快速通道扫描全部分区或误删新责任。 */
+    /**
+     * 只登记存在严格迁移或归还状态的源槽及其最新声明，避免快速通道扫描全部分区或误删新责任。
+     */
     private final ConcurrentHashMap<PartitionSlot, MigrationClaim> activeStrictControlSources =
             new ConcurrentHashMap<>();
     private final ConcurrentHashMap<TaskEntry, Boolean> delayedRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<TaskEntry, Boolean> movingRegistry = new ConcurrentHashMap<>();
-    /** 只登记至少关联一条 MOVING 任务的槽位，使 1ms 快速通道的唤醒成本受分区数约束。 */
+    /**
+     * 只登记至少关联一条 MOVING 任务的槽位，使 1ms 快速通道的唤醒成本受分区数约束。
+     */
     private final ConcurrentHashMap<PartitionSlot, Boolean> activeMovingAuditSlots = new ConcurrentHashMap<>();
-    /** 迁移审计读侧计数与回收门禁共同提供一次轻量 grace period，阻止弱一致迭代器访问已复用条目。 */
+    /**
+     * 迁移审计读侧计数与回收门禁共同提供一次轻量 grace period，阻止弱一致迭代器访问已复用条目。
+     */
     private final AtomicInteger movingAuditors = new AtomicInteger();
     private final AtomicBoolean movingRecycleGate = new AtomicBoolean();
-    private final TaskEntryPool taskEntryPool = new TaskEntryPool();
+    private final TaskEntryPool taskEntryPool;
     private final DelayedReferencePool delayedReferencePool = new DelayedReferencePool();
 
     /**
-     * 业务作用：构造全局分区子系统实例；实际队列与 worker 只在 {@link #start()} 时创建。
+     * 业务作用：构造绑定同名时间轮的分区执行域；实际队列与 worker 只在 startInternal 时创建。
      *
-     * 参数说明: 无。
-     * 返回: 构造完成后处于 STOPPED，不接受任务。
+     * @param runnerName  应用级稳定 Runner 名称
+     * @param timingWheel 延迟与观察任务绑定的同场景时间轮 Runner
+     *                    返回: 构造完成后处于 STOPPED，不接受任务。
      */
-    private Partition() {
+    private Partition(String runnerName, TimingWheel.TimingWheelRunner timingWheel) {
+        this.runnerName = TimingWheel.validateRunnerName(runnerName);
+        this.timingWheel = Objects.requireNonNull(timingWheel, "timingWheel");
+        if (!this.runnerName.equals(timingWheel.getRunnerName())) {
+            throw new IllegalArgumentException("Partition and TimingWheel runnerName must match");
+        }
+        this.observerUnique = Partition.class.getName() + ".observer." + this.runnerName;
+        this.observerAction = this::advanceObserver;
+        this.taskEntryPool = new TaskEntryPool(this);
+    }
+
+    /**
+     * 业务作用：按名称取得相互隔离的分区 Runner，并绑定同名 TimingWheel Runner。
+     *
+     * @param runnerName 应用级稳定 Runner 名称
+     *                   返回: 已存在或本次原子创建的分区 Runner。
+     */
+    public static PartitionRunner of(String runnerName) {
+        String validatedName = TimingWheel.validateRunnerName(runnerName);
+        return RUNNERS.computeIfAbsent(
+                validatedName,
+                name -> new PartitionRunner(name, TimingWheel.of(name))
+        );
+    }
+
+    /**
+     * 业务作用：在进程整体停机时关闭全部分区 Runner，确保依赖的时间轮关闭前不再产生延迟或观察动作。
+     * <p>
+     * 参数说明: 无。
+     * 返回: 无返回值；单个 Runner 未能完整收口时记录错误并继续关闭其它执行域。
+     */
+    private static void shutdownAll() {
+        RUNNERS.forEach((name, runner) -> {
+            try {
+                if (!runner.stop()) log.error("Partition Runner {} did not converge during shutdown", name);
+            } catch (Throwable failure) {
+                log.error("Partition Runner {} shutdown failed", name, failure);
+            }
+        });
     }
 
     /**
      * 业务作用：启动独立分区集群，完整创建所有队列和 worker 后一次性开放提交入口。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 无返回值；重复启动保持幂等，停机尚未收口时拒绝重新启动。
      */
     public static void start() {
-        INSTANCE.startInternal();
+        of(DEFAULT_RUNNER).start();
     }
 
     /**
      * 业务作用：关闭新提交，等待已登记 producer 收口，排空健康队列并停止全部分区 worker。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 完整收口并发布 STOPPED 时返回 true；任一阶段超时返回 false 并保留 STOPPING 状态。
      * <p>
      * <b>返回 false 的处置契约</b>：本方法<b>没有时间上界</b>，返回 false 不代表"再等一会儿就好"，
      * 循环重试也不改变收敛条件。两条超时路径的语义完全不同，调用方必须区分：
      * <ul>
-     *   <li><b>全局 producer 未归零</b>——有线程长期停在 {@code submit}/{@code exec} 内部。
+     *   <li><b>本 Runner producer 未归零</b>——有线程长期停在 {@code submit}/{@code exec} 内部。
      *       重试通常有效，因为这些线程会自行退出。</li>
      *   <li><b>worker 未排空</b>——某个分区仍持有无法推进的入站严格盗洞：源分区已经无法继续
      *       交付该盗洞的任务，而目标 worker 必须等盗洞清空才能退出。此时没有任何后台机制
@@ -269,157 +382,296 @@ public final class Partition {
      * 调用方应当在有限次重试后停止重试并上报，用 {@link #isHealthy()} 与
      * {@link #failedPartitionCount()} 判定是否已有分区进入 FAILED，再决定是否放弃优雅停机。
      * <p>
-     * 设计取舍说明：早期实现带有超时后强制冻结卡死盗洞的 backstop，可保证停机有界，
-     * 代价是把在途任务冻结成失败证据（有损）。当前实现移除了该 backstop，改为依赖
-     * 各条卡死根因被逐个修复，因此把"停机可能不收敛"显式暴露给调用方，而不是静默兜底。
+     * 设计取舍说明：本实现不在超时后强制冻结卡住的盗洞，因为该策略会把在途任务转成失败证据并造成
+     * 有损停机。因此“停机可能不收敛”会显式暴露给调用方，由业务决定告警、人工介入或进程级处置。
      */
     public static boolean stop() {
-        return INSTANCE.stopInternal();
+        PartitionRunner runner = RUNNERS.get(DEFAULT_RUNNER);
+        return runner == null || runner.stop();
     }
 
     /**
      * 业务作用：判断分区子系统是否已经完整开放提交。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 当前生命周期为 ACCEPTING 时返回 true。
      */
     public static boolean isStarted() {
-        return INSTANCE.lifecycle.get().phase == LifecyclePhase.ACCEPTING;
+        PartitionRunner runner = RUNNERS.get(DEFAULT_RUNNER);
+        return runner != null && runner.isStarted();
     }
 
     /**
-     * 业务作用：判断分区子系统是否可接收任务且没有分区 worker/共享原队列故障。
-     *
+     * 业务作用：判断 default 分区执行域的观察控制依赖是否完整且没有分区故障。
+     * <p>
      * 参数说明: 无。
-     * 返回: 已启动且失败分区数为零时返回 true。
+     * 返回: 分区已启动、没有失败分区且绑定时间轮仍保有本代观察任务时返回 true；false 不代表数据面
+     * 必然拒绝任务，时间轮被单独重启后须重启 Partition 才能恢复控制能力。
      */
     public static boolean isHealthy() {
-        return isStarted() && INSTANCE.failedPartitionCount.get() == 0;
+        PartitionRunner runner = RUNNERS.get(DEFAULT_RUNNER);
+        return runner != null && runner.isHealthy();
     }
 
     /**
      * 业务作用：暴露已经失败关闭的原始分区数量，供上层熔断和运维恢复决策使用。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 当前代已发布分区级 FAILED 的槽位数。
      */
     public static int failedPartitionCount() {
-        return INSTANCE.failedPartitionCount.get();
+        PartitionRunner runner = RUNNERS.get(DEFAULT_RUNNER);
+        return runner == null ? 0 : runner.failedPartitionCount();
     }
 
     /**
      * 业务作用：返回当前代实际分区数，供容量监控和路由诊断使用。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 已启动或停机收口中的槽位数；完全停止时为 0。
      */
     public static int partitionCount() {
-        return INSTANCE.lifecycle.get().slots.length;
+        PartitionRunner runner = RUNNERS.get(DEFAULT_RUNNER);
+        return runner == null ? 0 : runner.partitionCount();
     }
 
     /**
      * 业务作用：按对象 key 的稳定 hash 路由并立即提交 typed 分区任务。
      *
-     * @param key 路由 key；null 固定落到 hash 0
+     * @param key  路由 key；null 固定落到 hash 0
      * @param task 业务任务，类型和保序属性进入框架后不得改变
-     * 返回: 与内部任务状态共用权威的稳定提交句柄；未启动或故障时返回 REJECTED，使用完应 recycle/close。
+     *             返回: 与内部任务状态共用权威的稳定提交句柄；未启动或故障时返回 REJECTED，使用完应 recycle/close。
      */
     public static Submission submit(Object key, Task task) {
-        return INSTANCE.stableSubmission(
-                INSTANCE.submitHashed(key == null ? 0 : key.hashCode(), task, false)
-        );
+        return of(DEFAULT_RUNNER).submit(key, task);
     }
 
     /**
      * 业务作用：按 primitive long key 无装箱路由并立即提交 typed 分区任务。
      *
-     * @param key long 路由 key
+     * @param key  long 路由 key
      * @param task 业务任务，类型和保序属性进入框架后不得改变
-     * 返回: 与内部任务状态共用权威的稳定提交句柄；未启动或故障时返回 REJECTED，使用完应 recycle/close。
+     *             返回: 与内部任务状态共用权威的稳定提交句柄；未启动或故障时返回 REJECTED，使用完应 recycle/close。
      */
     public static Submission submit(long key, Task task) {
-        return INSTANCE.stableSubmission(INSTANCE.submitHashed(Long.hashCode(key), task, false));
+        return of(DEFAULT_RUNNER).submit(key, task);
     }
 
     /**
      * 业务作用：登记对象 key 的延迟分区任务，到期时才读取当时路由并增加对应逻辑计数。
      *
-     * @param key 路由 key；null 固定落到 hash 0
+     * @param key         路由 key；null 固定落到 hash 0
      * @param delayMillis 延迟毫秒数；0 按立即提交处理，不能为负数
-     * @param task 业务任务
-     * 返回: 可在到期前取消的稳定提交句柄；TimingWheel 不可用时返回 REJECTED，使用完应 recycle/close。
+     * @param task        业务任务
+     *                    返回: 可在到期前取消的稳定提交句柄；TimingWheel 不可用时返回 REJECTED，使用完应 recycle/close。
      */
     public static Submission submit(Object key, long delayMillis, Task task) {
-        return INSTANCE.stableSubmission(
-                INSTANCE.submitDelayedHashed(key == null ? 0 : key.hashCode(), delayMillis, task, false)
-        );
+        return of(DEFAULT_RUNNER).submit(key, delayMillis, task);
     }
 
     /**
      * 业务作用：以 primitive long key 无装箱登记延迟分区任务，到期时再执行完整路由协议。
      *
-     * @param key long 路由 key
+     * @param key         long 路由 key
      * @param delayMillis 延迟毫秒数；0 按立即提交处理，不能为负数
-     * @param task 业务任务
-     * 返回: 可在到期前取消的稳定提交句柄；TimingWheel 不可用时返回 REJECTED，使用完应 recycle/close。
+     * @param task        业务任务
+     *                    返回: 可在到期前取消的稳定提交句柄；TimingWheel 不可用时返回 REJECTED，使用完应 recycle/close。
      */
     public static Submission submit(long key, long delayMillis, Task task) {
-        return INSTANCE.stableSubmission(
-                INSTANCE.submitDelayedHashed(Long.hashCode(key), delayMillis, task, false)
-        );
+        return of(DEFAULT_RUNNER).submit(key, delayMillis, task);
     }
 
     /**
      * 业务作用：按对象 key 立即提交无需取消或状态查询的任务，并在物理完成后自动归还内部条目。
      *
-     * @param key 路由 key；null 固定落到 hash 0
+     * @param key  路由 key；null 固定落到 hash 0
      * @param task 业务任务
-     * 返回: 无返回值；拒绝原因不对调用方保留，适用于 fire-and-forget 零 GC 路径。
+     *             返回: 无返回值；拒绝原因不对调用方保留，适用于 fire-and-forget 零 GC 路径。
      */
     public static void exec(Object key, Task task) {
-        INSTANCE.submitHashed(key == null ? 0 : key.hashCode(), task, true);
+        of(DEFAULT_RUNNER).exec(key, task);
     }
 
     /**
      * 业务作用：按 primitive long key 立即提交无需句柄的任务，避免 key 装箱并自动回收内部条目。
      *
-     * @param key long 路由 key
+     * @param key  long 路由 key
      * @param task 业务任务
-     * 返回: 无返回值；任务终态且物理摘除后归还对象池。
+     *             返回: 无返回值；任务终态且物理摘除后归还对象池。
      */
     public static void exec(long key, Task task) {
-        INSTANCE.submitHashed(Long.hashCode(key), task, true);
+        of(DEFAULT_RUNNER).exec(key, task);
     }
 
     /**
      * 业务作用：按对象 key 登记无需取消句柄的延迟任务，复用池化到期动作并在完整收口后自动归池。
      *
-     * @param key 路由 key；null 固定落到 hash 0
+     * @param key         路由 key；null 固定落到 hash 0
      * @param delayMillis 延迟毫秒数；0 按立即提交处理，不能为负数
-     * @param task 业务任务
-     * 返回: 无返回值；调用方不持有 Submission，停机拒绝仍由内部状态机安全处理。
+     * @param task        业务任务
+     *                    返回: 无返回值；调用方不持有 Submission，停机拒绝仍由内部状态机安全处理。
      */
     public static void exec(Object key, long delayMillis, Task task) {
-        INSTANCE.submitDelayedHashed(key == null ? 0 : key.hashCode(), delayMillis, task, true);
+        of(DEFAULT_RUNNER).exec(key, delayMillis, task);
     }
 
     /**
      * 业务作用：以 primitive long key 登记 fire-and-forget 延迟任务，避免装箱并自动回收全部内部载体。
      *
-     * @param key long 路由 key
+     * @param key         long 路由 key
      * @param delayMillis 延迟毫秒数；0 按立即提交处理，不能为负数
-     * @param task 业务任务
-     * 返回: 无返回值；定时包装释放前条目保持回收 hold，禁止迟到回调访问复用对象。
+     * @param task        业务任务
+     *                    返回: 无返回值；定时包装释放前条目保持回收 hold，禁止迟到回调访问复用对象。
      */
     public static void exec(long key, long delayMillis, Task task) {
-        INSTANCE.submitDelayedHashed(Long.hashCode(key), delayMillis, task, true);
+        of(DEFAULT_RUNNER).exec(key, delayMillis, task);
+    }
+
+    /**
+     * 业务作用：向绑定 Runner 暴露当前分区执行域是否已经完整开放提交。
+     * <p>
+     * 参数说明: 无。
+     * 返回: 当前生命周期为 ACCEPTING 时返回 true。
+     */
+    private boolean runnerStarted() {
+        return this.lifecycle.get().phase == LifecyclePhase.ACCEPTING;
+    }
+
+    /**
+     * 业务作用：向绑定 Runner 暴露观察控制依赖是否完整且没有分区故障。
+     * <p>
+     * 参数说明: 无。
+     * 返回: 已启动、失败分区数为零且观察任务仍属于绑定时间轮现役代次时返回 true；false 只证明
+     * 完整能力受损，不承诺立即或延迟提交均已关闭。
+     */
+    private boolean runnerHealthy() {
+        return this.runnerStarted()
+                && this.failedPartitionCount.get() == 0
+                && this.timingWheel.isStarted()
+                && this.observerTimingWheelEpoch == this.timingWheel.lifecycleEpoch();
+    }
+
+    /**
+     * 业务作用：返回本 Runner 当前代已经失败关闭的原始分区数量。
+     * <p>
+     * 参数说明: 无。
+     * 返回: 当前代已发布 FAILED 的槽位数。
+     */
+    private int runnerFailedPartitionCount() {
+        return this.failedPartitionCount.get();
+    }
+
+    /**
+     * 业务作用：返回本 Runner 当前代实际分区数，支持容量与路由诊断。
+     * <p>
+     * 参数说明: 无。
+     * 返回: 已启动或停机收口中的槽位数；完全停止时为 0。
+     */
+    private int runnerPartitionCount() {
+        return this.lifecycle.get().slots.length;
+    }
+
+    /**
+     * 业务作用：为 Runner 的对象 key 入口建立稳定提交句柄，不跨越到其它分区执行域。
+     *
+     * @param key  路由 key；null 固定落到 hash 0
+     * @param task 业务任务
+     *             返回: 与内部任务状态共用权威的稳定提交句柄。
+     */
+    private Submission submitForRunner(Object key, Task task) {
+        return this.stableSubmission(this.submitHashed(key == null ? 0 : key.hashCode(), task, false));
+    }
+
+    /**
+     * 业务作用：为 Runner 的 primitive long key 入口无装箱建立稳定提交句柄。
+     *
+     * @param key  long 路由 key
+     * @param task 业务任务
+     *             返回: 与内部任务状态共用权威的稳定提交句柄。
+     */
+    private Submission submitForRunner(long key, Task task) {
+        return this.stableSubmission(this.submitHashed(Long.hashCode(key), task, false));
+    }
+
+    /**
+     * 业务作用：为 Runner 的对象 key 登记延迟分区任务，到期后只进入本执行域路由。
+     *
+     * @param key         路由 key；null 固定落到 hash 0
+     * @param delayMillis 延迟毫秒数
+     * @param task        业务任务
+     *                    返回: 可查询和取消的稳定提交句柄。
+     */
+    private Submission submitForRunner(Object key, long delayMillis, Task task) {
+        return this.stableSubmission(
+                this.submitDelayedHashed(key == null ? 0 : key.hashCode(), delayMillis, task, false)
+        );
+    }
+
+    /**
+     * 业务作用：为 Runner 的 primitive long key 无装箱登记延迟分区任务。
+     *
+     * @param key         long 路由 key
+     * @param delayMillis 延迟毫秒数
+     * @param task        业务任务
+     *                    返回: 可查询和取消的稳定提交句柄。
+     */
+    private Submission submitForRunner(long key, long delayMillis, Task task) {
+        return this.stableSubmission(
+                this.submitDelayedHashed(Long.hashCode(key), delayMillis, task, false)
+        );
+    }
+
+    /**
+     * 业务作用：从 Runner 的对象 key 快速入口立即提交任务，并在物理完成后自动释放内部条目。
+     *
+     * @param key  路由 key；null 固定落到 hash 0
+     * @param task 业务任务
+     *             返回: 无返回值。
+     */
+    private void execForRunner(Object key, Task task) {
+        this.submitHashed(key == null ? 0 : key.hashCode(), task, true);
+    }
+
+    /**
+     * 业务作用：从 Runner 的 primitive long key 快速入口无装箱立即提交任务。
+     *
+     * @param key  long 路由 key
+     * @param task 业务任务
+     *             返回: 无返回值。
+     */
+    private void execForRunner(long key, Task task) {
+        this.submitHashed(Long.hashCode(key), task, true);
+    }
+
+    /**
+     * 业务作用：从 Runner 的对象 key 快速入口登记延迟任务并自动释放内部条目。
+     *
+     * @param key         路由 key；null 固定落到 hash 0
+     * @param delayMillis 延迟毫秒数
+     * @param task        业务任务
+     *                    返回: 无返回值。
+     */
+    private void execForRunner(Object key, long delayMillis, Task task) {
+        this.submitDelayedHashed(key == null ? 0 : key.hashCode(), delayMillis, task, true);
+    }
+
+    /**
+     * 业务作用：从 Runner 的 primitive long key 快速入口无装箱登记延迟任务。
+     *
+     * @param key         long 路由 key
+     * @param delayMillis 延迟毫秒数
+     * @param task        业务任务
+     *                    返回: 无返回值。
+     */
+    private void execForRunner(long key, long delayMillis, Task task) {
+        this.submitDelayedHashed(Long.hashCode(key), delayMillis, task, true);
     }
 
     /**
      * 业务作用：在生命周期锁内创建新一代分区槽位，防止半启动状态对 producer 可见。
-     *
+     * <p>
      * 参数说明: 无。
-     * 返回: 无返回值；所有 worker 与唯一分区观察任务就绪后才发布 ACCEPTING 快照。
+     * 返回: 无返回值；所有 worker 与本 Runner 唯一观察任务就绪后才发布 ACCEPTING 快照。
      */
     private void startInternal() {
         this.lifecycleLock.lock();
@@ -429,7 +681,7 @@ public final class Partition {
             if (current.phase == LifecyclePhase.STOPPING) {
                 throw new IllegalStateException("Partition is still stopping");
             }
-            if (!TimingWheel.isStarted()) {
+            if (!this.timingWheel.isStarted()) {
                 // 延迟入口依赖时间轮的取消与到期驱动，启动顺序错误时不能开放一个能力不完整的分区代次。
                 throw new IllegalStateException("TimingWheel must be started before Partition");
             }
@@ -452,11 +704,16 @@ public final class Partition {
                     slots[i] = slot;
                     started++;
                 }
-                this.scheduleObserver();
-                if (!TimingWheel.isStarted()) {
+                if (!this.timingWheel.isStarted()) {
                     throw new IllegalStateException("TimingWheel stopped while Partition was starting");
                 }
+                long timingWheelEpoch = this.timingWheel.lifecycleEpoch();
+                this.scheduleObserver();
+                if (!this.timingWheel.isStarted() || this.timingWheel.lifecycleEpoch() != timingWheelEpoch) {
+                    throw new IllegalStateException("TimingWheel lifecycle changed while Partition was starting");
+                }
 
+                this.observerTimingWheelEpoch = timingWheelEpoch;
                 this.failedPartitionCount.set(0);
                 this.lifecycle.set(new Lifecycle(epoch, LifecyclePhase.ACCEPTING, slots, partitionCount - 1, null));
             } catch (Throwable failure) {
@@ -475,7 +732,7 @@ public final class Partition {
 
     /**
      * 业务作用：分阶段关闭当前代，只有 producer 和 worker 都已证明收口后才发布 STOPPED。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 已经或本轮完成 STOPPED 发布时返回 true；任何阶段超时返回 false 并保留 STOPPING 快照。
      */
@@ -497,18 +754,20 @@ public final class Partition {
                         current.mask,
                         current
                 );
-                // 先关闭全局入口，迟到 producer 登记旧代后复验失败，只会退出而不会再发布任务。
+                // 先关闭本 Runner 入口，迟到 producer 登记旧代后复验失败，只会退出而不会再发布任务。
                 this.lifecycle.set(stopping);
             }
 
-            // 先关闭全局入口再撤销周期任务；已经开始的回调会在代次复验失败后停止发布控制副作用。
+            // 先关闭本 Runner 入口再撤销周期任务；已经开始的回调会在代次复验失败后停止发布控制副作用。
             this.cancelObserver();
 
             this.rejectDelayedEntries("Partition 停机取消尚未到期任务");
 
             Lifecycle accepting = stopping.predecessor;
             if (accepting != null && !awaitZero(accepting.inflight, stopTimeoutMillis())) {
-                log.error("Partition stop timed out waiting for {} global producers", accepting.inflight.get());
+                log.error("Partition Runner {} stop timed out waiting for {} producers",
+                        this.runnerName,
+                        accepting.inflight.get());
                 return false;
             }
             // 捕获关闭入口前已登记、但第一次扫描时尚未进入注册表的迟到延迟提交。
@@ -523,7 +782,13 @@ public final class Partition {
                 if (!slot.awaitStopped(timeoutMillis)) allStopped = false;
             }
             if (!allStopped) {
-                log.error("Partition stop timed out waiting for one or more workers; lifecycle remains STOPPING");
+                log.error("Partition Runner {} stop timed out waiting for one or more workers; lifecycle remains STOPPING",
+                        this.runnerName);
+                return false;
+            }
+            if (!this.drainStoppedFailureRetentions(stopping.slots, timeoutMillis)) {
+                log.error("Partition Runner {} stop could not release all retained failure data; lifecycle remains STOPPING",
+                        this.runnerName);
                 return false;
             }
 
@@ -537,8 +802,35 @@ public final class Partition {
     }
 
     /**
-     * 业务作用：从无业务上下文的短生命周期线程登记唯一分区观察任务，避免启动调用方上下文被长期持有。
+     * 业务作用：在全部 worker 与 producer 停止后代替各槽位完成最后一轮故障收口，保证成功停机不依赖 GC 丢弃业务引用。
      *
+     * @param slots         当前关闭代次的全部分区槽位
+     * @param timeoutMillis 最长收口时间
+     *                      返回: 全部故障收口队列清空返回 true；仍有迁移发布者未完成或达到时限返回 false。
+     */
+    private boolean drainStoppedFailureRetentions(PartitionSlot[] slots, long timeoutMillis) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(1L, timeoutMillis));
+        while (true) {
+            boolean pending = false;
+            boolean progressed = false;
+            for (PartitionSlot slot : slots) {
+                if (slot.lifecycle.get().phase == SlotPhase.FAILED) {
+                    boolean cleaned = slot.cleanupFailedSlotRetentions();
+                    pending |= !cleaned;
+                } else {
+                    progressed |= slot.drainFailureRetentions();
+                }
+                pending |= slot.hasFailureRetentions();
+            }
+            if (!pending) return true;
+            if (System.nanoTime() - deadline >= 0L) return false;
+            if (!progressed) LockSupport.parkNanos(STOP_DRAIN_PARK_NANOS);
+        }
+    }
+
+    /**
+     * 业务作用：从无业务上下文的短生命周期线程登记本 Runner 唯一观察任务，避免启动调用方上下文被长期持有。
+     * <p>
      * 参数说明: 无。
      * 返回: 无返回值；登记异常会同步传播，调用方不得发布缺少负载观察或控制推进能力的分区代次。
      */
@@ -546,15 +838,15 @@ public final class Partition {
         AtomicReference<Throwable> failure = new AtomicReference<>();
         Thread registrar = Thread.ofVirtual()
                 .inheritInheritableThreadLocals(false)
-                .name("Virtual-Partition-observer-registrar")
+                .name("Virtual-Partition-" + this.runnerName + "-observer-registrar")
                 .start(() -> {
                     try {
-                        // 观察器是唯一的进程级高频任务；走 platform 快速通道，避免每个 tick 创建虚拟线程执行载体。
-                        TimingWheel.platform(
+                        // 每个 Runner 只有一个高频观察任务；绑定本场景 platform 快速通道，禁止控制动作跨域。
+                        this.timingWheel.platform(
                                 OBSERVER_INTERVAL_MILLIS,
                                 OBSERVER_INTERVAL_MILLIS,
-                                OBSERVER_UNIQUE,
-                                OBSERVER_ACTION
+                                this.observerUnique,
+                                this.observerAction
                         );
                     } catch (Throwable throwable) {
                         failure.set(throwable);
@@ -580,19 +872,20 @@ public final class Partition {
     }
 
     /**
-     * 业务作用：撤销唯一分区观察任务，阻止停机后继续发布窃取请求或推进旧代迁移。
-     *
+     * 业务作用：撤销本 Runner 唯一观察任务，阻止停机后继续发布窃取请求或推进旧代迁移。
+     * <p>
      * 参数说明: 无。
      * 返回: 无返回值；TimingWheel 已停止或任务已经取消时保持幂等。
      */
     private void cancelObserver() {
-        if (!TimingWheel.isStarted()) return;
-        TimingWheel.cancel(OBSERVER_UNIQUE);
+        this.observerTimingWheelEpoch = 0L;
+        if (!this.timingWheel.isStarted()) return;
+        this.timingWheel.cancel(this.observerUnique);
     }
 
     /**
      * 业务作用：通过唯一 1ms 快速通道推进迁移控制，并按 1 秒节流周期集中观察热点负载。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 无返回值；普通 tick 只检查活动控制状态和观察截止时刻，生命周期变化时不推进旧代状态。
      */
@@ -638,8 +931,8 @@ public final class Partition {
     /**
      * 业务作用：按单次 O(N) 槽位快照选择最繁忙源分区，并为合格空闲目标批量发布窃取请求。
      *
-     * @param global 已由唯一观察任务登记 inflight 并复验为当前 ACCEPTING 的全局快照
-     * 返回: 无返回值；没有热点时不产生控制副作用，每轮首条成功请求为严格类型保留独立候选机会。
+     * @param global 已由唯一观察任务登记 inflight 并复验为当前 ACCEPTING 的 Runner 生命周期快照
+     *               返回: 无返回值；没有热点时不产生控制副作用，每轮首条成功请求为严格类型保留独立候选机会。
      */
     private void observeLoad(Lifecycle global) {
         int idleThreshold = idleTaskThreshold();
@@ -694,7 +987,7 @@ public final class Partition {
 
     /**
      * 业务作用：把活动 MOVING 条目的审计责任定向交给去重后的责任槽位，隔离业务 Task 所有者回调与时间轮线程。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 无返回值；单轮最多访问每个活动槽位一次，不随 MOVING 条目数量增长。
      */
@@ -709,7 +1002,7 @@ public final class Partition {
      *
      * @param source 当前物理摘除方
      * @param target 计划接收任务的分区
-     * 返回: 无返回值；同一槽位的多条迁移通过精确引用计数合并为一个活动登记。
+     *               返回: 无返回值；同一槽位的多条迁移通过精确引用计数合并为一个活动登记。
      */
     private void registerMovingAuditSlots(PartitionSlot source, PartitionSlot target) {
         this.registerMovingAuditSlot(source);
@@ -726,7 +1019,7 @@ public final class Partition {
      * 业务作用：增加单个迁移审计槽位的活动引用，并在首条迁移到达时发布给 1ms 快速通道。
      *
      * @param slot 需要其唯一 worker 参与迁移审计的槽位
-     * 返回: 无返回值；登记失败会回滚引用计数，调用方不得继续发布 MOVING。
+     *             返回: 无返回值；登记失败会回滚引用计数，调用方不得继续发布 MOVING。
      */
     private void registerMovingAuditSlot(PartitionSlot slot) {
         int previous = slot.movingAuditRegistrations.getAndIncrement();
@@ -744,7 +1037,7 @@ public final class Partition {
      *
      * @param source 当前物理摘除方
      * @param target 计划接收任务的分区
-     * 返回: 无返回值；并发新登记胜出时会重新发布槽位，不能被迟到摘除覆盖。
+     *               返回: 无返回值；并发新登记胜出时会重新发布槽位，不能被迟到摘除覆盖。
      */
     private void unregisterMovingAuditSlots(PartitionSlot source, PartitionSlot target) {
         this.unregisterMovingAuditSlot(source);
@@ -755,7 +1048,7 @@ public final class Partition {
      * 业务作用：减少单个迁移审计槽位的活动引用，并在线性化归零后安全撤销快速通道登记。
      *
      * @param slot 已结束一条关联迁移的槽位
-     * 返回: 无返回值；引用异常时冻结槽位，避免观察责任在计数损坏后静默丢失。
+     *             返回: 无返回值；引用异常时冻结槽位，避免观察责任在计数损坏后静默丢失。
      */
     private void unregisterMovingAuditSlot(PartitionSlot slot) {
         int remaining = slot.movingAuditRegistrations.decrementAndGet();
@@ -772,12 +1065,12 @@ public final class Partition {
     }
 
     /**
-     * 业务作用：在全局与分区两级代次门禁内完成立即提交，防止停机或分区失败后迟到发布。
+     * 业务作用：在 Runner 与分区两级代次门禁内完成立即提交，防止停机或分区失败后迟到发布。
      *
-     * @param keyHash 已计算的业务 key hash
-     * @param task 待提交的 typed 任务
+     * @param keyHash     已计算的业务 key hash
+     * @param task        待提交的 typed 任务
      * @param autoRecycle 调用方不接收句柄、允许物理收口后自动归池时为 true
-     * 返回: 稳定任务条目；受理成功后可执行/取消，失败时包含明确拒绝原因。
+     *                    返回: 稳定任务条目；受理成功后可执行/取消，失败时包含明确拒绝原因。
      */
     private TaskEntry submitHashed(int keyHash, Task task, boolean autoRecycle) {
         Objects.requireNonNull(task, "task");
@@ -797,7 +1090,7 @@ public final class Partition {
      * 业务作用：为需要状态查询或取消能力的提交创建稳定外部句柄，隔离池化条目的跨代 ABA。
      *
      * @param entry 已完成本次提交初始化的内部任务条目
-     * 返回: 不参与对象池复用的轻量句柄；调用方释放前持有条目本代的唯一外部回收权。
+     *              返回: 不参与对象池复用的轻量句柄；调用方释放前持有条目本代的唯一外部回收权。
      */
     private Submission stableSubmission(TaskEntry entry) {
         long generation = entry.recycleGeneration();
@@ -813,11 +1106,11 @@ public final class Partition {
     /**
      * 业务作用：登记尚无分区所有权的延迟任务，并把轻量到期回调交给 TimingWheel。
      *
-     * @param keyHash 已计算的路由 hash
+     * @param keyHash     已计算的路由 hash
      * @param delayMillis 延迟毫秒数
-     * @param task 业务任务
+     * @param task        业务任务
      * @param autoRecycle 调用方不保留句柄、允许完整收口后自动归池时为 true
-     * 返回: DELAYED、REJECTED 或立即提交后的稳定句柄。
+     *                    返回: DELAYED、REJECTED 或立即提交后的稳定句柄。
      */
     private TaskEntry submitDelayedHashed(
             int keyHash,
@@ -844,7 +1137,7 @@ public final class Partition {
                     entry.reject("Partition 延迟提交代次已经关闭");
                     return entry;
                 }
-                if (!TimingWheel.isStarted()) {
+                if (!this.timingWheel.isStarted()) {
                     entry.reject("TimingWheel 尚未启动，无法登记延迟任务");
                     return entry;
                 }
@@ -871,7 +1164,7 @@ public final class Partition {
                 this.delayedRegistry.put(entry, Boolean.TRUE);
                 try {
                     // ActionRecycler 在正常到期和 TimingWheel 惰性取消路径都会归池，并级联释放条目回调 hold。
-                    TimingWheel.exec(delayMillis, unique, expiryAction);
+                    this.timingWheel.exec(delayMillis, unique, expiryAction);
                 } catch (Throwable failure) {
                     this.delayedRegistry.remove(entry);
                     // TimingWheel 在参数初始化异常时可能尚未接管 Action；PooledHandle 让该补偿可安全重复。
@@ -892,18 +1185,19 @@ public final class Partition {
      * 业务作用：执行池化延迟动作槽位中的到期引用，把运行期参数从捕获 lambda 改为 Recycler 引用槽。
      *
      * @param action TimingWheel 调用的池化 ActionRecycler
-     * 返回: 无返回值；ActionRecycler 的 finally 负责归池并级联释放 DelayedReference。
+     *               返回: 无返回值；ActionRecycler 的 finally 负责归池并级联释放 DelayedReference。
      */
     private static void runDelayedExpiryAction(ActionRecycler action) {
         DelayedReference reference = action.ref(0);
-        INSTANCE.expireDelayed(reference.entry());
+        TaskEntry entry = reference.entry();
+        entry.partition.expireDelayed(entry);
     }
 
     /**
      * 业务作用：到期时竞争 DELAYED 到 ENQUEUEING，并按当前路由提交；取消或停机胜出后回调只回收自身。
      *
      * @param entry TimingWheel 回调持有的稳定提交条目
-     * 返回: 无返回值；所有异常在回调内转为 REJECTED，绝不抛回时间轮执行链。
+     *              返回: 无返回值；所有异常在回调内转为 REJECTED，绝不抛回时间轮执行链。
      */
     private void expireDelayed(TaskEntry entry) {
         try {
@@ -921,14 +1215,14 @@ public final class Partition {
      * 业务作用：停机时原子拒绝注册表中仍为 DELAYED 的任务，不等待最长 delay 自然到期。
      *
      * @param reason 稳定停机拒绝原因
-     * 返回: 无返回值；TimingWheel 中迟到轻量回调只会观察终态，不再持有业务任务。
+     *               返回: 无返回值；TimingWheel 中迟到轻量回调只会观察终态，不再持有业务任务。
      */
     private void rejectDelayedEntries(String reason) {
         for (TaskEntry entry : this.delayedRegistry.keySet()) {
             if (entry.rejectDelayed(reason)) {
                 this.delayedRegistry.remove(entry);
                 String unique = entry.delayUnique;
-                if (unique != null && TimingWheel.isStarted()) TimingWheel.cancel(unique);
+                if (unique != null && this.timingWheel.isStarted()) this.timingWheel.cancel(unique);
             }
         }
     }
@@ -937,7 +1231,7 @@ public final class Partition {
      * 业务作用：由转移两侧任一健康 worker 帮助提交并发取消，并把长期停留在 MOVING 的任务冻结为可追踪证据。
      *
      * @param observer 本轮执行审计的分区 worker
-     * 返回: 本轮至少帮助取消或发布一笔转移故障时返回 true。
+     *                 返回: 本轮至少帮助取消或发布一笔转移故障时返回 true。
      */
     private boolean auditMovingEntries(PartitionSlot observer) {
         if (this.movingRegistry.isEmpty() || this.movingRecycleGate.get()) return false;
@@ -974,7 +1268,7 @@ public final class Partition {
 
     /**
      * 业务作用：在迁移条目撤出注册表后等待所有旧弱一致迭代器退出，建立对象池复用前的 grace period。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 无返回值；返回时后续审计者不可能再取得已撤出的旧代条目引用。
      */
@@ -992,11 +1286,11 @@ public final class Partition {
     }
 
     /**
-     * 业务作用：在全局与分区两级代次门禁内路由一个已完成上下文捕获的任务条目。
+     * 业务作用：在 Runner 与分区两级代次门禁内路由一个已完成上下文捕获的任务条目。
      *
      * @param keyHash 已计算的业务 key hash
-     * @param entry 状态为 ENQUEUEING 的稳定条目
-     * 返回: 无返回值；成功后进入唯一队列，失败时发布明确 REJECTED。
+     * @param entry   状态为 ENQUEUEING 的稳定条目
+     *                返回: 无返回值；成功后进入唯一队列，失败时发布明确 REJECTED。
      */
     private void routeExisting(int keyHash, TaskEntry entry) {
 
@@ -1040,7 +1334,7 @@ public final class Partition {
      * 业务作用：把配置的任意正整数分区数向上归一化为 2 的幂，保证 mask 路由不会产生越界或偏斜。
      *
      * @param requested 配置请求的分区数
-     * 返回: 1 到 2^30 之间的 2 的幂。
+     *                  返回: 1 到 2^30 之间的 2 的幂。
      */
     private static int normalizePartitionCount(int requested) {
         int count = Math.max(1, requested);
@@ -1055,7 +1349,7 @@ public final class Partition {
      * 业务作用：扩散业务 hash 的高低位并清除符号位，降低低位重复造成的热点分区。
      *
      * @param hash 原始业务 hash
-     * 返回: 可安全与非负 mask 做按位与的扩散值。
+     *             返回: 可安全与非负 mask 做按位与的扩散值。
      */
     private static int spread(int hash) {
         return (hash ^ (hash >>> 16)) & 0x7fffffff;
@@ -1064,9 +1358,9 @@ public final class Partition {
     /**
      * 业务作用：以短 park 分轮等待精确在途计数归零，避免控制线程长时间占用 CPU 自旋。
      *
-     * @param counter 只接受旧代 producer 退出的精确计数
+     * @param counter       只接受旧代 producer 退出的精确计数
      * @param timeoutMillis 总等待上限
-     * 返回: 上限内观察到零返回 true；超时返回 false，调用方不得继续破坏性清理。
+     *                      返回: 上限内观察到零返回 true；超时返回 false，调用方不得继续破坏性清理。
      */
     private static boolean awaitZero(AtomicInteger counter, long timeoutMillis) {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
@@ -1079,7 +1373,7 @@ public final class Partition {
 
     /**
      * 业务作用：读取统一停机时限，约束 producer 收口和 worker 排空的最长单阶段等待。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 大于等于 1ms 的停机阶段时限。
      */
@@ -1089,7 +1383,7 @@ public final class Partition {
 
     /**
      * 业务作用：读取分区绝对空闲阈值，统一盗洞续租、窃取候选和后续归还判断口径。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 大于等于 0 的逻辑任务数量阈值。
      */
@@ -1099,7 +1393,7 @@ public final class Partition {
 
     /**
      * 业务作用：读取迁移、归还和 catch-up 单阶段总时限，超时后必须失败关闭而不能永久悬挂。
-     *
+     * <p>
      * 参数说明: 无。
      * 返回: 大于等于 1ms 的单阶段纳秒时限。
      */
@@ -1112,7 +1406,7 @@ public final class Partition {
      * 业务作用：安全调用被拒绝/取消任务的对象池回收钩子，避免框架不再执行时出现脱池泄漏。
      *
      * @param task 已确定不会再执行的业务任务
-     * 返回: 无返回值；单笔回收异常只记录，不得破坏后续故障收口。
+     *             返回: 无返回值；单笔回收异常只记录，不得破坏后续故障收口。
      */
     @SuppressWarnings("rawtypes")
     private static void recycleDropped(Task task) {
@@ -1149,7 +1443,7 @@ public final class Partition {
     }
 
     /**
-     * 全局不可变生命周期快照；inflight 只属于本代，predecessor 仅在 STOPPING 时指向被关闭的 ACCEPTING 代。
+     * Runner 不可变生命周期快照；inflight 只属于本代，predecessor 仅在 STOPPING 时指向被关闭的 ACCEPTING 代。
      */
     private static final class Lifecycle {
 
@@ -1161,14 +1455,14 @@ public final class Partition {
         final Lifecycle predecessor;
 
         /**
-         * 业务作用：创建一次性发布的全局生命周期快照，隔离新旧代 producer 计数。
+         * 业务作用：创建一次性发布的 Runner 生命周期快照，隔离新旧代 producer 计数。
          *
-         * @param epoch 生命周期代次
-         * @param phase 当前阶段
-         * @param slots 本代稳定槽位数组
-         * @param mask 路由掩码
+         * @param epoch       生命周期代次
+         * @param phase       当前阶段
+         * @param slots       本代稳定槽位数组
+         * @param mask        路由掩码
          * @param predecessor 停机时被关闭的前一代；其他阶段为 null
-         * 返回: 构造完成后字段不可变，inflight 仅由持有本快照的 producer 使用。
+         *                    返回: 构造完成后字段不可变，inflight 仅由持有本快照的 producer 使用。
          */
         Lifecycle(long epoch, LifecyclePhase phase, PartitionSlot[] slots, int mask, Lifecycle predecessor) {
             this.epoch = epoch;
@@ -1182,7 +1476,7 @@ public final class Partition {
          * 业务作用：创建不持有任何队列和 worker 的 STOPPED 快照，防止旧槽位被新提交重新引用。
          *
          * @param epoch 停止状态代次
-         * 返回: 空槽位、mask 为 0 的 STOPPED 快照。
+         *              返回: 空槽位、mask 为 0 的 STOPPED 快照。
          */
         static Lifecycle stopped(long epoch) {
             return new Lifecycle(epoch, LifecyclePhase.STOPPED, new PartitionSlot[0], 0, null);
@@ -1203,7 +1497,7 @@ public final class Partition {
          *
          * @param epoch 分区生命周期代次
          * @param phase 分区提交阶段
-         * 返回: 构造完成后阶段不可变，inflight 独立于其他代次。
+         *              返回: 构造完成后阶段不可变，inflight 独立于其他代次。
          */
         SlotLifecycle(long epoch, SlotPhase phase) {
             this.epoch = epoch;
@@ -1226,11 +1520,11 @@ public final class Partition {
         /**
          * 业务作用：创建严格类型路由代次，把状态、正确作用域的 producer 门禁和执行门禁绑定为稳定快照。
          *
-         * @param epoch 路由代次
-         * @param state 路由控制状态
-         * @param tunnel 非 LOCAL 状态绑定的严格盗洞；LOCAL/FAILED 可为 null
+         * @param epoch         路由代次
+         * @param state         路由控制状态
+         * @param tunnel        非 LOCAL 状态绑定的严格盗洞；LOCAL/FAILED 可为 null
          * @param returnContext 归还相关状态绑定的类型级上下文；其他状态为 null
-         * 返回: 构造完成后路由字段不可变。
+         *                      返回: 构造完成后路由字段不可变。
          */
         StrictRoute(
                 long epoch,
@@ -1264,9 +1558,9 @@ public final class Partition {
         /**
          * 业务作用：冻结严格盗洞安装所需的全部信息，避免申请线程取得门禁后暂停造成永久阻塞。
          *
-         * @param expectedRoute 被替换的 LOCAL 路由
+         * @param expectedRoute  被替换的 LOCAL 路由
          * @param migratingRoute 已完整构造的 MIGRATING 路由
-         * 返回: 构造完成后字段不可变，任意帮助者都可执行同一组 CAS。
+         *                       返回: 构造完成后字段不可变，任意帮助者都可执行同一组 CAS。
          */
         MigrationClaim(StrictRoute expectedRoute, StrictRoute migratingRoute) {
             this.expectedRoute = expectedRoute;
@@ -1281,7 +1575,7 @@ public final class Partition {
 
         /**
          * 业务作用：在任务取得本逻辑所有者之前增加精确计数，防止控制面观察到漏计窗口。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 增加后的精确逻辑数量。
          */
@@ -1289,7 +1583,7 @@ public final class Partition {
 
         /**
          * 业务作用：在执行、取消或迁出完成后减少本逻辑所有者计数，且每个任务只能成功一次。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 减少后的精确逻辑数量。
          */
@@ -1305,14 +1599,15 @@ public final class Partition {
         final AtomicReference<StrictRoute> strictRoute;
         final NonStrictTunnelGroup nonStrictGroup;
         final AtomicBoolean failed = new AtomicBoolean();
+        final AtomicBoolean failureCleanupQueued = new AtomicBoolean();
 
         /**
          * 业务作用：原子注册后固定任务类型的保序策略，避免同一类型混用两套路由协议。
          *
-         * @param taskType 稳定任务类型
+         * @param taskType    稳定任务类型
          * @param strictOrder 是否严格 FIFO
-         * @param source 固定原始分区
-         * 返回: 严格类型同时创建首个 LOCAL 路由，非严格类型不创建严格门禁。
+         * @param source      固定原始分区
+         *                    返回: 严格类型同时创建首个 LOCAL 路由，非严格类型不创建严格门禁。
          */
         TypeState(int taskType, boolean strictOrder, PartitionSlot source) {
             this.taskType = taskType;
@@ -1326,7 +1621,7 @@ public final class Partition {
 
         /**
          * 业务作用：在任务初次获得逻辑所有权前精确增加本类型数量。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 增加后的精确逻辑数量。
          */
@@ -1338,7 +1633,7 @@ public final class Partition {
 
         /**
          * 业务作用：在执行完成、取消或发布回滚的唯一终态路径精确减少本类型数量。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 减少后的精确数量；出现负数表示计数不变量被破坏。
          */
@@ -1360,9 +1655,9 @@ public final class Partition {
         /**
          * 业务作用：创建一代非严格盗洞活动数组，防止 producer 观察到原地修改的半成品。
          *
-         * @param epoch 路由代次
+         * @param epoch   路由代次
          * @param tunnels 本代完整活动盗洞数组
-         * 返回: 构造完成后数组引用不再修改。
+         *                返回: 构造完成后数组引用不再修改。
          */
         NonStrictRoute(long epoch, NonStrictTunnel[] tunnels) {
             this.epoch = epoch;
@@ -1385,9 +1680,9 @@ public final class Partition {
         /**
          * 业务作用：创建空盗洞组，新任务在首个活动盗洞发布前继续进入原始队列。
          *
-         * @param source 固定原始分区
+         * @param source    固定原始分区
          * @param typeState 非严格类型状态
-         * 返回: 初始活动快照为空。
+         *                  返回: 初始活动快照为空。
          */
         NonStrictTunnelGroup(PartitionSlot source, TypeState typeState) {
             this.source = source;
@@ -1396,7 +1691,7 @@ public final class Partition {
 
         /**
          * 业务作用：为 MP 新任务轮询选择并登记一个有效盗洞，过期或关闭候选会被协助摘除。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 已增加 producer 在途计数的盗洞；没有可用候选时返回 null。
          */
@@ -1417,7 +1712,7 @@ public final class Partition {
 
         /**
          * 业务作用：由原分区 worker 在自己与活动盗洞之间轮转存量任务，保留原分区执行份额。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 已登记 producer 在途计数的目标盗洞；本轮轮到原分区或无候选时返回 null。
          */
@@ -1440,7 +1735,7 @@ public final class Partition {
          * 业务作用：CAS 发布新增盗洞，避免与并发过期摘除互相覆盖。
          *
          * @param tunnel 已在目标分区登记、尚未对 producer 可见的盗洞
-         * 返回: 本次成功加入返回 true；同一实例已存在时返回 false。
+         *               返回: 本次成功加入返回 true；同一实例已存在时返回 false。
          */
         boolean add(NonStrictTunnel tunnel) {
             while (true) {
@@ -1460,7 +1755,7 @@ public final class Partition {
          * 业务作用：幂等地从最新活动快照摘除过期或故障盗洞，不覆盖并发新增的其他目标。
          *
          * @param tunnel 不再接收新任务的盗洞
-         * 返回: 盗洞已经不在活动快照或本次成功摘除时返回 true。
+         *               返回: 盗洞已经不在活动快照或本次成功摘除时返回 true。
          */
         boolean remove(NonStrictTunnel tunnel) {
             while (true) {
@@ -1484,7 +1779,7 @@ public final class Partition {
          * 业务作用：判断当前活动快照是否已经把本类型连接到指定目标，供源 worker 跳过重复配对并继续选择其他非严格类型。
          *
          * @param target 待接收任务的目标分区
-         * 返回: 已存在指向该目标的 OPEN 盗洞时返回 true；否则返回 false。
+         *               返回: 已存在指向该目标的 OPEN 盗洞时返回 true；否则返回 false。
          */
         boolean hasOpenTarget(PartitionSlot target) {
             NonStrictRoute current = this.route.get();
@@ -1510,9 +1805,9 @@ public final class Partition {
          * 业务作用：创建单调时钟租约，防止墙上时间跳变影响盗洞生存期。
          *
          * @param deadlineNanos 单调时钟截止点
-         * @param epoch 租约代次
-         * @param expired 是否为不可续租过期标记
-         * 返回: 构造完成后字段不可变。
+         * @param epoch         租约代次
+         * @param expired       是否为不可续租过期标记
+         *                      返回: 构造完成后字段不可变。
          */
         TunnelLease(long deadlineNanos, long epoch, boolean expired) {
             this.deadlineNanos = deadlineNanos;
@@ -1542,13 +1837,14 @@ public final class Partition {
         final AtomicInteger logicalCount = new AtomicInteger();
         final AtomicReference<TunnelLease> lease;
         final AtomicBoolean failureRecorded = new AtomicBoolean();
+        volatile String failureReason;
 
         /**
          * 业务作用：创建从原分区直达空闲目标分区的非严格任务通道，尚未加入活动快照前不接收任务。
          *
-         * @param group 所属原分区与类型的盗洞组
+         * @param group  所属原分区与类型的盗洞组
          * @param target 唯一消费本盗洞的目标分区
-         * 返回: 初始状态 OPEN，并持有首个单调时钟租约。
+         *               返回: 初始状态 OPEN，并持有首个单调时钟租约。
          */
         NonStrictTunnel(NonStrictTunnelGroup group, PartitionSlot target) {
             this.group = group;
@@ -1563,7 +1859,7 @@ public final class Partition {
          * 业务作用：登记 producer 后复验状态和租约，覆盖旧快照读者与摘除并发的发布窗口。
          *
          * @param now 当前单调时钟值
-         * 返回: 本次 producer 可以发布时返回 true；调用方结束后必须调用 {@link #exitProducer()}。
+         *            返回: 本次 producer 可以发布时返回 true；调用方结束后必须调用 {@link #exitProducer()}。
          */
         boolean tryEnterProducer(long now) {
             TunnelLease currentLease = this.lease.get();
@@ -1577,19 +1873,20 @@ public final class Partition {
 
         /**
          * 业务作用：在队列 offer 完成后以原子写退出盗洞 producer 临界区，使关闭方可安全观察归零。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；必须与成功的 tryEnterProducer 一一配对。
          */
         void exitProducer() {
-            this.inflight.decrementAndGet();
+            int remaining = this.inflight.decrementAndGet();
+            if (remaining == 0 && this.state.get() == FAILED) this.target.wakeWorker();
         }
 
         /**
          * 业务作用：判断当前实际租约是否已经过期，供 producer 和目标 worker 协助关闭。
          *
          * @param now 当前单调时钟值
-         * 返回: 已发布过期标记或截止时间已到时返回 true。
+         *            返回: 已发布过期标记或截止时间已到时返回 true。
          */
         boolean isExpired(long now) {
             TunnelLease current = this.lease.get();
@@ -1598,7 +1895,7 @@ public final class Partition {
 
         /**
          * 业务作用：按实际读取租约 CAS 不可续租标记，并幂等推进 DRAINING 与活动快照摘除。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；已被其他线程续租时不会误删新租约。
          */
@@ -1616,7 +1913,7 @@ public final class Partition {
          * 业务作用：由仍空闲、健康且确认盗洞仍在使用的目标 worker CAS 发布新租约；过期标记一旦出现就不得抢回 OPEN。
          *
          * @param now 当前单调时钟值
-         * 返回: 成功续租返回 true；盗洞已过期或不再 OPEN 时返回 false。
+         *            返回: 成功续租返回 true；盗洞已过期或不再 OPEN 时返回 false。
          */
         boolean renew(long now) {
             if (this.state.get() != OPEN) return false;
@@ -1627,19 +1924,21 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：标记专属盗洞队列故障并从活动路由摘除，保留队列中的未执行任务证据。
+         * 业务作用：标记专属盗洞队列故障并从活动路由摘除，交由目标 worker 终结和释放未执行任务。
          *
-         * @param reason 故障原因
+         * @param reason  故障原因
          * @param failure 原始异常；没有时为 null
-         * 返回: 无返回值；不会扩大为原始分区共享队列故障。
+         *                返回: 无返回值；不会扩大为原始分区共享队列故障。
          */
         void fail(String reason, Throwable failure) {
             this.state.set(FAILED);
             this.lease.set(TunnelLease.EXPIRED);
             this.group.remove(this);
             if (this.failureRecorded.compareAndSet(false, true)) {
+                this.failureReason = reason;
                 this.target.failedNonStrictTunnels.offer(this);
                 this.target.inboundNonStrictTunnels.remove(this);
+                this.target.wakeWorker();
             }
             if (failure == null) {
                 log.error("Non-strict tunnel {} -> {} taskType {} FAILED: {}",
@@ -1652,7 +1951,7 @@ public final class Partition {
 
         /**
          * 业务作用：判断盗洞是否仍可出现在活动快照中。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 状态为 OPEN 时返回 true。
          */
@@ -1662,7 +1961,7 @@ public final class Partition {
 
         /**
          * 业务作用：在任务进入盗洞前增加目标分区和本盗洞精确逻辑计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 增加后的盗洞逻辑数量。
          */
@@ -1674,7 +1973,7 @@ public final class Partition {
 
         /**
          * 业务作用：在盗洞任务完成、取消或发布回滚时减少目标分区和本盗洞精确逻辑计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 减少后的盗洞逻辑数量。
          */
@@ -1690,11 +1989,17 @@ public final class Partition {
      */
     private static final class StrictTunnel implements LogicalCounter {
 
-        /** 当前负载不要求归还严格执行权。 */
+        /**
+         * 当前负载不要求归还严格执行权。
+         */
         static final int RETURN_NOT_REQUIRED = 0;
-        /** 目标存在足够的其他竞争负载，需要归还严格执行权。 */
+        /**
+         * 目标存在足够的其他竞争负载，需要归还严格执行权。
+         */
         static final int RETURN_FOR_PRESSURE = 1;
-        /** 当前盗洞持续为空，需要释放临时执行权和通道资源。 */
+        /**
+         * 当前盗洞持续为空，需要释放临时执行权和通道资源。
+         */
         static final int RETURN_FOR_EMPTY = 2;
 
         final PartitionSlot source;
@@ -1705,16 +2010,27 @@ public final class Partition {
         final MPSCLinkedQueue<TaskEntry> incrementalQueue = new MPSCLinkedQueue<>();
         final MPSCLinkedQueue.ConsumerCursor stockCursor = new MPSCLinkedQueue.ConsumerCursor();
         final MPSCLinkedQueue.ConsumerCursor incrementalCursor = new MPSCLinkedQueue.ConsumerCursor();
-        /** 仅统计跨代直投本盗洞的 producer；改投 staging 后不再增加，保证归还边界可收敛。 */
+        /**
+         * 仅统计跨代直投本盗洞的 producer；改投 staging 后不再增加，保证归还边界可收敛。
+         */
         final AtomicInteger producerInflight = new AtomicInteger();
+        /**
+         * 源 worker 向存量 FIFO 发布期间持有，用于把故障清理推迟到最后一次物理发布完成之后。
+         */
+        final AtomicInteger stockInflight = new AtomicInteger();
         final AtomicInteger logicalCount = new AtomicInteger();
-        /** 每次严格任务进入盗洞前递增，用于识别两次空闲观察之间发生过的短任务。 */
+        /**
+         * 每次严格任务进入盗洞前递增，用于识别两次空闲观察之间发生过的短任务。
+         */
         final AtomicLong activityEpoch = new AtomicLong();
         final AtomicBoolean failed = new AtomicBoolean();
+        final AtomicBoolean targetFailureCleaned = new AtomicBoolean();
 
         volatile long sourceBoundary = -1L;
         volatile boolean migrationComplete;
-        /** 首次关闭严格盗洞的稳定原因，日志后端缺失时仍可由诊断和恢复流程读取。 */
+        /**
+         * 首次关闭严格盗洞的稳定原因，日志后端缺失时仍可由诊断和恢复流程读取。
+         */
         volatile String failureReason;
         int returnObservationMode;
         int returnObservationCount;
@@ -1724,11 +2040,11 @@ public final class Partition {
         /**
          * 业务作用：创建严格类型的唯一目标通道，保存旧 LOCAL 代次以封住存量 producer 边界。
          *
-         * @param source 原始分区
-         * @param target 取得临时执行权的目标分区
-         * @param typeState 严格类型状态
+         * @param source        原始分区
+         * @param target        取得临时执行权的目标分区
+         * @param typeState     严格类型状态
          * @param oldLocalRoute 被关闭的 LOCAL 路由快照
-         * 返回: 初始边界未知且迁移尚未完成，目标只能等待存量队列发布。
+         *                      返回: 初始边界未知且迁移尚未完成，目标只能等待存量队列发布。
          */
         StrictTunnel(
                 PartitionSlot source,
@@ -1744,7 +2060,7 @@ public final class Partition {
 
         /**
          * 业务作用：在严格任务进入存量或增量队列前记录活动代次，并增加目标分区和本盗洞精确计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 增加后的严格盗洞逻辑数量；活动代次同步前进一次，用于重置空闲归还观察。
          */
@@ -1758,7 +2074,7 @@ public final class Partition {
 
         /**
          * 业务作用：在严格盗洞任务完成、取消或发布回滚时减少目标分区和本盗洞精确计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 减少后的严格盗洞逻辑数量。
          */
@@ -1769,11 +2085,11 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：冻结严格类型两侧执行权并保留两个 FIFO，任何发布或边界故障都不得回退 LOCAL。
+         * 业务作用：冻结严格类型两侧执行权并登记两个 FIFO 的清理责任，任何发布或边界故障都不得回退 LOCAL。
          *
-         * @param reason 故障原因
+         * @param reason   故障原因
          * @param evidence 已离开公共队列的任务；没有时为 null
-         * 返回: 无返回值；首次故障把盗洞移出目标正常调度并登记恢复证据。
+         *                 返回: 无返回值；首次故障把盗洞移出目标正常调度并唤醒两侧完成资源收口。
          */
         void fail(String reason, TaskEntry evidence) {
             if (!this.failed.compareAndSet(false, true)) return;
@@ -1812,11 +2128,11 @@ public final class Partition {
         /**
          * 业务作用：为一次严格归还创建专属第三落点和私有 FIFO，分支确定前 staging 没有 consumer。
          *
-         * @param tunnel 当前持有严格执行权的盗洞
-         * @param stolenRoute 被 RETURN_PREPARE 关闭的 STOLEN 路由代次
-         * @param triggerMode 发起归还时满足的负载或空闲触发模式
+         * @param tunnel               当前持有严格执行权的盗洞
+         * @param stolenRoute          被 RETURN_PREPARE 关闭的 STOLEN 路由代次
+         * @param triggerMode          发起归还时满足的负载或空闲触发模式
          * @param triggerActivityEpoch 发起归还时盗洞最后一次任务活动代次
-         * 返回: 三个排他边界初始未知，暂存计数为零。
+         *                             返回: 三个排他边界初始未知，暂存计数为零。
          */
         StrictReturnContext(
                 StrictTunnel tunnel,
@@ -1833,7 +2149,7 @@ public final class Partition {
 
         /**
          * 业务作用：在归还窗口任务进入 staging 前增加独立精确计数，不提前归属原分区或目标分区。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 增加后的暂存任务数。
          */
@@ -1844,7 +2160,7 @@ public final class Partition {
 
         /**
          * 业务作用：暂存任务被最终 consumer 接管、取消或发布回滚时只减少一次独立计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 减少后的暂存任务数。
          */
@@ -1861,14 +2177,16 @@ public final class Partition {
 
         final PartitionSlot target;
         final AtomicBoolean pending = new AtomicBoolean();
-        /** 观察批次代次经队列 release/acquire 发布，供源 worker 合并同轮严格候选尝试。 */
+        /**
+         * 观察批次代次经队列 release/acquire 发布，供源 worker 合并同轮严格候选尝试。
+         */
         volatile long observationEpoch;
 
         /**
          * 业务作用：创建绑定空闲目标分区的可复用控制请求，避免每轮空闲探测分配新对象。
          *
          * @param target 希望接管任务的空闲分区
-         * 返回: 初始未挂入任何源分区控制队列。
+         *               返回: 初始未挂入任何源分区控制队列。
          */
         StealRequest(PartitionSlot target) {
             this.target = target;
@@ -1892,18 +2210,25 @@ public final class Partition {
         private final ConcurrentLinkedQueue<NonStrictTunnel> failedNonStrictTunnels = new ConcurrentLinkedQueue<>();
         private final ConcurrentLinkedQueue<StrictTunnel> failedStrictTunnels = new ConcurrentLinkedQueue<>();
         private final ConcurrentLinkedQueue<TaskEntry> failedEvidence = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<TypeState> failedTypeRetentions = new ConcurrentLinkedQueue<>();
         private final AtomicInteger localTaskCount = new AtomicInteger();
         private final AtomicInteger tunnelTaskCount = new AtomicInteger();
-        /** 当前需要本槽位 worker 参与审计的 MOVING 条目数，用于合并 1ms 唤醒。 */
+        /**
+         * 当前需要本槽位 worker 参与审计的 MOVING 条目数，用于合并 1ms 唤醒。
+         */
         private final AtomicInteger movingAuditRegistrations = new AtomicInteger();
         private final AtomicReference<SlotLifecycle> lifecycle;
         private final AtomicLong lifecycleEpoch = new AtomicLong();
+        private final AtomicReference<SlotLifecycle> failedPredecessor = new AtomicReference<>();
+        private final AtomicBoolean failedSubmissionQueueCleaned = new AtomicBoolean();
         private final AtomicInteger signal = new AtomicInteger();
         private final AtomicBoolean failureCounted = new AtomicBoolean();
         private final CountDownLatch stopped = new CountDownLatch(1);
         private final StealRequest stealRequest;
 
-        /** 以下三个字段只由本槽唯一 worker 更新，为同一观察批次提供有界的严格候选接力。 */
+        /**
+         * 以下三个字段只由本槽唯一 worker 更新，为同一观察批次提供有界的严格候选接力。
+         */
         private long strictOpportunityEpoch = Long.MIN_VALUE;
         private int strictOpportunityAttempts;
         private boolean strictOpportunityResolved;
@@ -1911,13 +2236,14 @@ public final class Partition {
         private volatile boolean running;
         private volatile Thread worker;
         private volatile String failureReason;
+
         /**
          * 业务作用：创建一代分区槽位及其唯一主队列，尚未启动 worker 前不对 producer 发布。
          *
-         * @param partition 所属分区子系统
-         * @param generation 全局启动代次
-         * @param slot 固定分区号
-         * 返回: 初始提交状态为 ACCEPTING，worker 尚未启动。
+         * @param partition  所属分区子系统
+         * @param generation Runner 启动代次
+         * @param slot       固定分区号
+         *                   返回: 初始提交状态为 ACCEPTING，worker 尚未启动。
          */
         PartitionSlot(Partition partition, long generation, int slot) {
             this.partition = partition;
@@ -1929,22 +2255,23 @@ public final class Partition {
 
         /**
          * 业务作用：启动绑定本槽位的唯一虚拟线程 consumer，并在返回前保存可唤醒线程引用。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；worker 启动后持续遵守单 consumer 约束。
          */
         void startWorker() {
             this.running = true;
             this.worker = Thread.ofVirtual()
-                    .name("Virtual-Partition-" + this.generation + '-' + this.slot)
+                    .name("Virtual-Partition-" + this.partition.runnerName + '-'
+                            + this.generation + '-' + this.slot)
                     .start(this::runWorker);
         }
 
         /**
          * 业务作用：在类型策略和路由代次门禁内把任务发布到本槽位主队列。
          *
-         * @param entry 已通过全局和分区级提交复验的稳定任务条目
-         * 返回: 无返回值；成功后条目为 QUEUED，失败则发布 REJECTED 并完整回滚。
+         * @param entry 已通过 Runner 和分区级提交复验的稳定任务条目
+         *              返回: 无返回值；成功后条目为 QUEUED，失败则发布 REJECTED 并完整回滚。
          */
         void enqueue(TaskEntry entry) {
             Task task = entry.task();
@@ -2034,9 +2361,11 @@ public final class Partition {
 
             try {
                 if (!this.prepareEntry(entry, task, typeState, typeState, this.slot, null, null)) return;
+                int retention = entry.prepareContainerPublish();
                 try {
                     this.queue.offer(entry);
                 } catch (Throwable failure) {
+                    entry.rollbackContainerPublish(retention);
                     entry.rejectQueued("主队列发布失败: " + failure.getClass().getSimpleName());
                     if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                     if (this.queue.isFailed()) {
@@ -2054,11 +2383,11 @@ public final class Partition {
         /**
          * 业务作用：在 RETURN_PREPARE/RETURNING 期间把新严格任务发布到无 consumer 的专属 staging 队列。
          *
-         * @param entry 稳定任务条目
-         * @param task 业务任务
+         * @param entry     稳定任务条目
+         * @param task      业务任务
          * @param typeState 原始分区严格类型状态
-         * @param context 当前路由原子绑定的归还上下文
-         * 返回: 无返回值；任务使用不可执行 OWNER_RETURN_STAGING，发布失败不会改投其他队列。
+         * @param context   当前路由原子绑定的归还上下文
+         *                  返回: 无返回值；任务使用不可执行 OWNER_RETURN_STAGING，发布失败不会改投其他队列。
          */
         void enqueueReturnStaging(
                 TaskEntry entry,
@@ -2080,9 +2409,11 @@ public final class Partition {
                     null
             )) return;
             entry.returnContext = context;
+            int retention = entry.prepareContainerPublish();
             try {
                 context.stagingQueue.offer(entry);
             } catch (Throwable failure) {
+                entry.rollbackContainerPublish(retention);
                 entry.rejectQueued("returnStaging 发布失败: " + failure.getClass().getSimpleName());
                 if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                 if (context.stagingQueue.isFailed()) {
@@ -2097,11 +2428,11 @@ public final class Partition {
         /**
          * 业务作用：在 MIGRATING/STOLEN 期间把严格增量任务直接发布到唯一盗洞增量 FIFO。
          *
-         * @param entry 稳定任务条目
-         * @param task 业务任务
+         * @param entry     稳定任务条目
+         * @param task      业务任务
          * @param typeState 原始分区严格类型状态
-         * @param tunnel 当前路由原子绑定的严格盗洞
-         * 返回: 无返回值；发布失败明确拒绝，永久死槽冻结整个严格类型。
+         * @param tunnel    当前路由原子绑定的严格盗洞
+         *                  返回: 无返回值；发布失败明确拒绝，永久死槽冻结整个严格类型。
          */
         void enqueueDirectStrictTunnel(
                 TaskEntry entry,
@@ -2114,9 +2445,11 @@ public final class Partition {
                 return;
             }
             if (!this.prepareEntry(entry, task, typeState, tunnel, tunnel.target.slot, null, tunnel)) return;
+            int retention = entry.prepareContainerPublish();
             try {
                 tunnel.incrementalQueue.offer(entry);
             } catch (Throwable failure) {
+                entry.rollbackContainerPublish(retention);
                 entry.rejectQueued("严格增量队列发布失败: " + failure.getClass().getSimpleName());
                 if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                 if (tunnel.incrementalQueue.isFailed()) {
@@ -2133,17 +2466,19 @@ public final class Partition {
         /**
          * 业务作用：把安装盗洞后的非严格新任务直接发布到目标队列，不再增加原始分区积压。
          *
-         * @param entry 稳定任务条目
-         * @param task 业务任务
+         * @param entry     稳定任务条目
+         * @param task      业务任务
          * @param typeState 原始分区类型策略
-         * @param tunnel 已登记 producer 临界区的活动盗洞
-         * 返回: 无返回值；发布失败完整回滚目标计数，专属死槽只关闭本盗洞。
+         * @param tunnel    已登记 producer 临界区的活动盗洞
+         *                  返回: 无返回值；发布失败完整回滚目标计数，专属死槽只关闭本盗洞。
          */
         void enqueueDirectTunnel(TaskEntry entry, Task task, TypeState typeState, NonStrictTunnel tunnel) {
             if (!this.prepareEntry(entry, task, typeState, tunnel, tunnel.target.slot, tunnel, null)) return;
+            int retention = entry.prepareContainerPublish();
             try {
                 tunnel.queue.offer(entry);
             } catch (Throwable failure) {
+                entry.rollbackContainerPublish(retention);
                 entry.rejectQueued("盗洞队列发布失败: " + failure.getClass().getSimpleName());
                 if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                 if (tunnel.queue.isFailed()) {
@@ -2157,14 +2492,14 @@ public final class Partition {
         /**
          * 业务作用：在任何物理队列发布前初始化所有权、上下文和接收方计数，并最后发布 QUEUED。
          *
-         * @param entry 稳定任务条目
-         * @param task 业务任务
-         * @param typeState 原始分区类型策略
-         * @param counter 当前逻辑所有者计数器
-         * @param owner 当前所有权分区号
-         * @param tunnel 当前物理落点是盗洞时的引用；原始队列为 null
+         * @param entry        稳定任务条目
+         * @param task         业务任务
+         * @param typeState    原始分区类型策略
+         * @param counter      当前逻辑所有者计数器
+         * @param owner        当前所有权分区号
+         * @param tunnel       当前物理落点是盗洞时的引用；原始队列为 null
          * @param strictTunnel 当前物理落点是严格盗洞时的引用；其他队列为 null
-         * 返回: 初始化成功返回 true；任一步失败都会发布 REJECTED 并返回 false。
+         *                     返回: 初始化成功返回 true；任一步失败都会发布 REJECTED 并返回 false。
          */
         boolean prepareEntry(
                 TaskEntry entry,
@@ -2196,7 +2531,7 @@ public final class Partition {
 
         /**
          * 业务作用：串行消费本槽位主队列，隔离单任务异常，并在停机时排空全部已受理任务。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；退出前始终通知 stopped，异常时先发布分区级 FAILED。
          */
@@ -2204,6 +2539,7 @@ public final class Partition {
             try {
                 while (true) {
                     boolean progressed = this.partition.auditMovingEntries(this);
+                    progressed |= this.drainFailureRetentions();
                     progressed |= this.drainControlRequests();
                     progressed |= this.advanceStrictMigrations();
                     progressed |= this.advanceLocalCatchups();
@@ -2215,6 +2551,9 @@ public final class Partition {
                     MPSCLinkedQueue.ConsumerHeadState headState = this.queue.consumerHeadState();
                     if (headState == MPSCLinkedQueue.ConsumerHeadState.FAILED) {
                         this.failSlot("主队列 consumer 到达永久死槽: " + this.queue.failureIndex(), null);
+                        while (!this.cleanupFailedSlotRetentions()) {
+                            LockSupport.parkNanos(this, STOP_DRAIN_PARK_NANOS);
+                        }
                         break;
                     }
 
@@ -2222,6 +2561,7 @@ public final class Partition {
                         if (headState == MPSCLinkedQueue.ConsumerHeadState.EMPTY
                                 && this.inboundNonStrictTunnels.isEmpty()
                                 && this.inboundStrictTunnels.isEmpty()
+                                && !this.hasFailureRetentions()
                                 && !this.hasActiveOutboundStrictTunnels()
                                 && this.controlQueue.consumerHeadState()
                                 == MPSCLinkedQueue.ConsumerHeadState.EMPTY) break;
@@ -2246,6 +2586,9 @@ public final class Partition {
                 }
             } catch (Throwable failure) {
                 this.failSlot("分区 worker 异常退出", failure);
+                while (!this.cleanupFailedSlotRetentions()) {
+                    LockSupport.parkNanos(this, STOP_DRAIN_PARK_NANOS);
+                }
             } finally {
                 this.running = false;
                 this.stopped.countDown();
@@ -2253,8 +2596,219 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：按批次消费主队列，限制单轮工作量并为后续控制请求和盗洞调度保留公平性。
+         * 业务作用：由本槽位唯一 worker 消费故障收口队列，逐项发布终态并解除任务、上下文和盗洞强引用。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 本轮至少完成一笔条目、盗洞或严格类型上下文收口时返回 true；producer 尚未归零时保留责任重试。
+         */
+        boolean drainFailureRetentions() {
+            boolean progressed = this.drainFailedEvidence();
+            progressed |= this.drainFailedNonStrictTunnels();
+            progressed |= this.drainFailedStrictTunnels();
+            progressed |= this.drainFailedTypeRetentions();
+            return progressed;
+        }
+
+        /**
+         * 业务作用：判断当前槽位是否仍承担故障数据收口责任，阻止 worker 在强引用尚未释放时退出或无限休眠。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 任一故障收口队列非空时返回 true。
+         */
+        boolean hasFailureRetentions() {
+            return !this.failedEvidence.isEmpty()
+                    || !this.failedNonStrictTunnels.isEmpty()
+                    || !this.failedStrictTunnels.isEmpty()
+                    || !this.failedTypeRetentions.isEmpty();
+        }
+
+        /**
+         * 业务作用：在分区级门禁失败后等待旧 producer 退出，跨过主队列死槽终结全部任务，并排空派生故障责任。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 主队列和全部故障收口队列均已解除业务强引用时返回 true。
+         */
+        boolean cleanupFailedSlotRetentions() {
+            SlotLifecycle predecessor = this.failedPredecessor.get();
+            if (predecessor == null || predecessor.inflight.get() != 0) return false;
+            if (!this.failedSubmissionQueueCleaned.get()) {
+                this.finalizeFailureEntries(this.queue, this.failureReason);
+                this.failedSubmissionQueueCleaned.set(true);
+            }
+            this.drainFailureRetentions();
+            return !this.hasFailureRetentions();
+        }
+
+        /**
+         * 业务作用：终结已经脱离物理队列的单笔失败证据；迁移发布者尚未退出时把责任放回队尾等待。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 本轮至少释放一笔证据时返回 true。
+         */
+        private boolean drainFailedEvidence() {
+            boolean progressed = false;
+            int budget = Math.max(1, DEFAULT_DRAIN_BATCH / 8);
+            while (budget-- > 0) {
+                TaskEntry entry = this.failedEvidence.poll();
+                if (entry == null) break;
+                if (!entry.beginFailureCleanupHandling()) {
+                    log.error("Partition failure cleanup entry lost queued ownership: slot={}", this.slot);
+                    entry.enqueueFailureCleanup(this);
+                    continue;
+                }
+                if (!entry.finalizeFailureRetention("任务执行权已经冻结")) {
+                    entry.retainFailureCleanup(this);
+                    continue;
+                }
+                progressed = true;
+            }
+            return progressed;
+        }
+
+        /**
+         * 业务作用：在非严格盗洞全部 producer 退出后终结其已发布任务，并让失效队列整体失去可达根。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 本轮至少释放一个失效盗洞时返回 true。
+         */
+        private boolean drainFailedNonStrictTunnels() {
+            boolean progressed = false;
+            int budget = Math.max(1, DEFAULT_DRAIN_BATCH / 32);
+            while (budget-- > 0) {
+                NonStrictTunnel tunnel = this.failedNonStrictTunnels.poll();
+                if (tunnel == null) break;
+                if (tunnel.inflight.get() != 0) {
+                    this.failedNonStrictTunnels.offer(tunnel);
+                    continue;
+                }
+                this.finalizeFailureEntries(tunnel.queue, tunnel.failureReason);
+                progressed = true;
+            }
+            return progressed;
+        }
+
+        /**
+         * 业务作用：由严格盗洞目标 worker 在两类物理 producer 归零后释放存量与增量 FIFO，并向源 worker 发布撤权完成。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 本轮至少释放一个严格盗洞目标侧状态时返回 true。
+         */
+        private boolean drainFailedStrictTunnels() {
+            boolean progressed = false;
+            int budget = Math.max(1, DEFAULT_DRAIN_BATCH / 32);
+            while (budget-- > 0) {
+                StrictTunnel tunnel = this.failedStrictTunnels.poll();
+                if (tunnel == null) break;
+                if (tunnel.producerInflight.get() != 0 || tunnel.stockInflight.get() != 0) {
+                    this.failedStrictTunnels.offer(tunnel);
+                    continue;
+                }
+                this.finalizeFailureEntries(tunnel.stockQueue, tunnel.failureReason);
+                this.finalizeFailureEntries(tunnel.incrementalQueue, tunnel.failureReason);
+                tunnel.targetFailureCleaned.set(true);
+                tunnel.source.wakeWorker();
+                progressed = true;
+            }
+            return progressed;
+        }
+
+        /**
+         * 业务作用：在目标撤权和全部严格 producer 收口后，由源 worker 释放 staging、私有 FIFO 及 FAILED 路由的盗洞引用。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 本轮至少断开一个严格类型故障上下文时返回 true。
+         */
+        private boolean drainFailedTypeRetentions() {
+            boolean progressed = false;
+            int budget = Math.max(1, DEFAULT_DRAIN_BATCH / 32);
+            while (budget-- > 0) {
+                TypeState typeState = this.failedTypeRetentions.poll();
+                if (typeState == null) break;
+                StrictRoute failedRoute = typeState.strictRoute.get();
+                if (failedRoute.state != StrictRouteState.FAILED) {
+                    this.failedTypeRetentions.offer(typeState);
+                    continue;
+                }
+                StrictTunnel tunnel = failedRoute.tunnel;
+                StrictReturnContext context = failedRoute.returnContext;
+                if ((tunnel != null && !tunnel.targetFailureCleaned.get())
+                        || !this.strictFailureProducersQuiesced(context)) {
+                    this.failedTypeRetentions.offer(typeState);
+                    continue;
+                }
+                if (context != null) {
+                    this.finalizeFailureEntries(context.stagingQueue,
+                            tunnel == null ? "严格归还上下文已经冻结" : tunnel.failureReason);
+                    this.finalizeFailureEntries(context.returnPending,
+                            tunnel == null ? "严格归还上下文已经冻结" : tunnel.failureReason);
+                    this.finalizeFailureEntries(context.postReturnPending,
+                            tunnel == null ? "严格归还上下文已经冻结" : tunnel.failureReason);
+                    context.returnPending.clear();
+                    context.postReturnPending.clear();
+                }
+                StrictRoute detached = new StrictRoute(
+                        failedRoute.epoch + 1,
+                        StrictRouteState.FAILED,
+                        null,
+                        null
+                );
+                if (!typeState.strictRoute.compareAndSet(failedRoute, detached)) {
+                    this.failedTypeRetentions.offer(typeState);
+                    continue;
+                }
+                progressed = true;
+            }
+            return progressed;
+        }
+
+        /**
+         * 业务作用：确认严格归还各代提交者已经退出，禁止清理线程与迟到 staging 发布并发访问同一任务条目。
          *
+         * @param context 当前 FAILED 路由保留的归还上下文；没有归还过程时为 null
+         *                返回: 所有可能写入 staging 的路由代次均已归零时返回 true。
+         */
+        private boolean strictFailureProducersQuiesced(StrictReturnContext context) {
+            if (context == null) return true;
+            if (context.stolenRoute.inflight.get() != 0) return false;
+            StrictRoute prepare = context.prepareRoute;
+            if (prepare != null && prepare.inflight.get() != 0) return false;
+            StrictRoute returning = context.returningRoute;
+            return returning == null || returning.inflight.get() == 0;
+        }
+
+        /**
+         * 业务作用：跨过永久死槽摘除故障 MPSC 中全部已发布任务，并把未稳定条目转交独立证据队列。
+         *
+         * @param entries 已确认全部 producer 退出的故障队列
+         * @param reason  容器级故障原因
+         *                返回: 无返回值；方法返回后队列不再持有任何已发布业务元素。
+         */
+        private void finalizeFailureEntries(MPSCLinkedQueue<TaskEntry> entries, String reason) {
+            String stableReason = reason == null ? "任务所在故障容器已经关闭" : reason;
+            entries.drainPublishedAfterProducersStop(entry -> {
+                if (!entry.detachFailedContainer()) return;
+                if (!entry.finalizeFailureRetention(stableReason)) entry.retainFailureCleanup(this);
+            });
+        }
+
+        /**
+         * 业务作用：把一个已经关闭 producer 的故障容器转换成逐笔终态；不稳定条目转入独立证据队列继续等待。
+         *
+         * @param entries 待解除引用的任务集合
+         * @param reason  容器级故障原因
+         *                返回: 无返回值；方法返回后调用方可以丢弃原容器的最后一个强引用。
+         */
+        private void finalizeFailureEntries(Iterable<TaskEntry> entries, String reason) {
+            String stableReason = reason == null ? "任务所在故障容器已经关闭" : reason;
+            for (TaskEntry entry : entries) {
+                if (!entry.detachFailedContainer()) continue;
+                if (!entry.finalizeFailureRetention(stableReason)) entry.retainFailureCleanup(this);
+            }
+        }
+
+        /**
+         * 业务作用：按批次消费主队列，限制单轮工作量并为后续控制请求和盗洞调度保留公平性。
+         * <p>
          * 参数说明: 无。
          * 返回: 本轮至少物理取得一个真实任务时返回 true；队头暂不可推进时返回 false。
          */
@@ -2276,7 +2830,7 @@ public final class Partition {
 
         /**
          * 业务作用：由原分区 worker 串行处理其他空闲分区提交的盗洞申请，避免并发修改类型控制状态。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本轮至少处理一个控制请求时返回 true。
          */
@@ -2323,7 +2877,7 @@ public final class Partition {
          * 业务作用：为空闲目标分区选择积压最多的非严格类型并安装一个独立盗洞。
          *
          * @param target 发起申请且将成为唯一盗洞 consumer 的目标分区
-         * 返回: 安装成功返回 true；跨线程调用、没有候选、目标已忙或状态变化时返回 false。
+         *               返回: 安装成功返回 true；跨线程调用、没有候选、目标已忙或状态变化时返回 false。
          */
         boolean installNonStrictTunnel(PartitionSlot target) {
             if (Thread.currentThread() != this.worker) {
@@ -2367,7 +2921,7 @@ public final class Partition {
          * 业务作用：由源分区唯一 worker 选择最繁忙 LOCAL 严格类型，并为目标发布完整迁移声明和唯一盗洞。
          *
          * @param target 发起申请且将成为严格盗洞唯一 consumer 的目标分区
-         * 返回: MIGRATING 路由成功发布时返回 true；跨线程调用、无候选或门禁竞争失败时返回 false。
+         *               返回: MIGRATING 路由成功发布时返回 true；跨线程调用、无候选或门禁竞争失败时返回 false。
          */
         boolean installStrictTunnelFor(PartitionSlot target) {
             if (Thread.currentThread() != this.worker) {
@@ -2412,8 +2966,8 @@ public final class Partition {
          * 业务作用：帮助完成已经占住旧 LOCAL executionGate 的严格迁移声明，消除声明线程暂停造成的控制权失联。
          *
          * @param typeState 声明所属严格类型
-         * @param local 当前观测到的旧 LOCAL 路由
-         * 返回: 迁移路由已经由本线程或其他线程发布时返回 true；声明失效并安全撤销时返回 false。
+         * @param local     当前观测到的旧 LOCAL 路由
+         *                  返回: 迁移路由已经由本线程或其他线程发布时返回 true；声明失效并安全撤销时返回 false。
          */
         boolean helpMigrationClaim(TypeState typeState, StrictRoute local) {
             Object gate = local.executionGate.get();
@@ -2467,7 +3021,7 @@ public final class Partition {
          * 业务作用：阻止两个分区同时建立反向盗洞，避免目标因本地变忙时又把任务交回原分区形成控制振荡。
          *
          * @param other 申请成为新目标的分区
-         * 返回: 当前分区已经消费来自 other 的任一活动盗洞时返回 true。
+         *              返回: 当前分区已经消费来自 other 的任一活动盗洞时返回 true。
          */
         boolean hasInboundFrom(PartitionSlot other) {
             for (NonStrictTunnel tunnel : this.inboundNonStrictTunnels.keySet()) {
@@ -2481,7 +3035,7 @@ public final class Partition {
 
         /**
          * 业务作用：由目标分区唯一消费所有入站非严格盗洞，按真实使用续租并在空闲过期后安全关闭资源。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本轮至少取得一个真实盗洞任务时返回 true。
          */
@@ -2525,7 +3079,7 @@ public final class Partition {
 
         /**
          * 业务作用：异步封住旧 LOCAL producer 边界，并在主队列唯一 consumer 到达边界后发布严格存量迁移完成。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本轮至少记录一个边界或完成一个迁移时返回 true。
          */
@@ -2571,7 +3125,7 @@ public final class Partition {
 
         /**
          * 业务作用：由目标 worker 先消费严格存量 FIFO，确认迁移完成且存量排空后再切到 STOLEN 并消费增量 FIFO。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本轮至少取得一个严格任务或完成一次 MIGRATING 到 STOLEN 切换时返回 true。
          */
@@ -2672,7 +3226,7 @@ public final class Partition {
 
         /**
          * 业务作用：由原分区 worker 按 returnPending、主队列边界、staging、postReturnPending 顺序完成 LOCAL_CATCHUP。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本轮至少执行/转换一笔任务、记录 staging 边界或发布 LOCAL 时返回 true。
          */
@@ -2719,11 +3273,21 @@ public final class Partition {
                     if (staged == null) break;
                     progressed = true;
                     if (staged.state() == TaskEntry.CANCELLED || staged.state() == TaskEntry.REJECTED) {
-                        staged.releaseDroppedTask();
+                        staged.beginContainerHandling();
+                        try {
+                            staged.releaseDroppedTask();
+                        } finally {
+                            staged.completeContainerHandling(this);
+                        }
                         continue;
                     }
-                    if (!this.takeStagedEntry(staged, context, context.stagingCursor.sequence())) continue;
-                    this.executeCatchupEntry(staged, context, "returnStaging");
+                    staged.beginContainerHandling();
+                    try {
+                        if (!this.takeStagedEntry(staged, context, context.stagingCursor.sequence())) continue;
+                        this.executeHandledCatchupEntry(staged, context, "returnStaging");
+                    } finally {
+                        staged.completeContainerHandling(this);
+                    }
                 }
                 if (context.stagingQueue.consumerBoundary() < context.stagingBoundary) continue;
 
@@ -2751,10 +3315,10 @@ public final class Partition {
         /**
          * 业务作用：把 staging 哨兵所有权转为原分区，先增加接收方再减少暂存计数，并帮助完成并发取消。
          *
-         * @param entry staging 唯一 consumer 取得的任务
-         * @param context 当前类型归还上下文
+         * @param entry    staging 唯一 consumer 取得的任务
+         * @param context  当前类型归还上下文
          * @param sequence staging 队列槽位序号
-         * 返回: 成功取得原分区所有权且仍需执行时返回 true；取消或故障时返回 false。
+         *                 返回: 成功取得原分区所有权且仍需执行时返回 true；取消或故障时返回 false。
          */
         boolean takeStagedEntry(TaskEntry entry, StrictReturnContext context, long sequence) {
             context.typeState.increment();
@@ -2790,12 +3354,29 @@ public final class Partition {
         /**
          * 业务作用：在 LOCAL_CATCHUP 独占执行门禁下执行已经按三个边界排好顺序的任务。
          *
-         * @param entry 已从私有 FIFO 或 staging 取得的稳定本地任务
+         * @param entry   已从私有 FIFO 或 staging 取得的稳定本地任务
          * @param context 当前类型归还上下文
-         * @param stage 诊断用阶段名
-         * 返回: 无返回值；无法取得执行权时冻结类型，不能把任务重新排到主队列尾部。
+         * @param stage   诊断用阶段名
+         *                返回: 无返回值；无法取得执行权时冻结类型，不能把任务重新排到主队列尾部。
          */
         void executeCatchupEntry(TaskEntry entry, StrictReturnContext context, String stage) {
+            entry.beginContainerHandling();
+            try {
+                this.executeHandledCatchupEntry(entry, context, stage);
+            } finally {
+                entry.completeContainerHandling(this);
+            }
+        }
+
+        /**
+         * 业务作用：在私有严格 FIFO 的处理权内执行一笔 catch-up 任务并完成业务终态发布。
+         *
+         * @param entry   已取得物理处理权的任务条目
+         * @param context 当前严格归还上下文
+         * @param stage   诊断用顺序阶段
+         *                返回: 无返回值；物理持有的解除和 FAILED 收口登记由外层 executeCatchupEntry 统一完成。
+         */
+        private void executeHandledCatchupEntry(TaskEntry entry, StrictReturnContext context, String stage) {
             if (entry.state() == TaskEntry.CANCELLED || entry.state() == TaskEntry.REJECTED) {
                 // 私有 FIFO 的唯一 consumer 已完成物理摘除，取消对象不再参与任何后续边界。
                 entry.releaseDroppedTask();
@@ -2825,7 +3406,7 @@ public final class Partition {
          *
          * @param tunnel 当前稳定 STOLEN 的严格盗洞
          * @param stolen 当前 STOLEN 路由快照
-         * 返回: 本次成功发布 RETURN_PREPARE 时返回 true。
+         *               返回: 本次成功发布 RETURN_PREPARE 时返回 true。
          */
         boolean maybeStartStrictReturn(StrictTunnel tunnel, StrictRoute stolen) {
             if (stolen.state != StrictRouteState.STOLEN || stolen.tunnel != tunnel) return false;
@@ -2875,7 +3456,7 @@ public final class Partition {
          * 业务作用：按目标竞争负载和空盗洞安静状态判断严格执行权的归还触发模式。
          *
          * @param tunnel 当前由本目标分区消费的严格盗洞
-         * 返回: 目标存在足够竞争负载时返回 RETURN_FOR_PRESSURE；盗洞已空且原分区空闲时返回 RETURN_FOR_EMPTY；否则返回 RETURN_NOT_REQUIRED。
+         *               返回: 目标存在足够竞争负载时返回 RETURN_FOR_PRESSURE；盗洞已空且原分区空闲时返回 RETURN_FOR_EMPTY；否则返回 RETURN_NOT_REQUIRED。
          */
         int strictReturnMode(StrictTunnel tunnel) {
             long targetLocal = this.localTaskCount.get();
@@ -2897,8 +3478,8 @@ public final class Partition {
          * 业务作用：在目标 worker 上异步推进 RETURN_PREPARE 和 RETURNING，不占住 worker 等待 producer。
          *
          * @param tunnel 正在归还的严格盗洞
-         * @param route 当前观测到的归还路由
-         * 返回: 本轮至少推进状态、转移任务或发布边界时返回 true。
+         * @param route  当前观测到的归还路由
+         *               返回: 本轮至少推进状态、转移任务或发布边界时返回 true。
          */
         boolean advanceStrictReturnOnTarget(StrictTunnel tunnel, StrictRoute route) {
             if (route.tunnel != tunnel) {
@@ -2980,10 +3561,12 @@ public final class Partition {
                 if (entry == null) break;
                 progressed = true;
                 if (entry.state() == TaskEntry.CANCELLED || entry.state() == TaskEntry.REJECTED) {
+                    entry.beginContainerHandling();
                     entry.releaseDroppedTask();
+                    entry.completeContainerHandling(this);
                     continue;
                 }
-                if (!this.moveStrictReturnEntry(entry, context, tunnel.incrementalCursor.sequence())) return true;
+                if (!this.handleStrictReturnEntry(entry, context, tunnel.incrementalCursor.sequence())) return true;
             }
 
             if (tunnel.incrementalQueue.consumerHeadState() == MPSCLinkedQueue.ConsumerHeadState.FAILED) {
@@ -3021,11 +3604,28 @@ public final class Partition {
         }
 
         /**
+         * 业务作用：在目标 worker 持有增量 FIFO 条目期间推进严格归还，并在未转交新容器时统一解除物理持有。
+         *
+         * @param entry    已从严格增量 FIFO 摘除的任务
+         * @param context  当前严格归还上下文
+         * @param sequence 原增量 FIFO 槽位序号
+         *                 返回: 任务已成功转交原分区主队列时返回 true；失败或取消时返回 false。
+         */
+        boolean handleStrictReturnEntry(TaskEntry entry, StrictReturnContext context, long sequence) {
+            entry.beginContainerHandling();
+            try {
+                return this.moveStrictReturnEntry(entry, context, sequence);
+            } finally {
+                entry.completeContainerHandling(this);
+            }
+        }
+
+        /**
          * 业务作用：原分区在 RETURN_PREPARE 阶段失效时，按旧盗洞边界、staging、新盗洞顺序安全撤销归还。
          *
          * @param tunnel 保持目标执行能力的严格盗洞
-         * @param route 当前 STOLEN_CATCHUP 路由
-         * 返回: 本轮至少执行/转换任务、记录 staging 边界或恢复 STOLEN 时返回 true。
+         * @param route  当前 STOLEN_CATCHUP 路由
+         *               返回: 本轮至少执行/转换任务、记录 staging 边界或恢复 STOLEN 时返回 true。
          */
         boolean advanceStolenCatchupOnTarget(StrictTunnel tunnel, StrictRoute route) {
             if (route.tunnel != tunnel) {
@@ -3066,11 +3666,21 @@ public final class Partition {
                 if (entry == null) break;
                 progressed = true;
                 if (entry.state() == TaskEntry.CANCELLED || entry.state() == TaskEntry.REJECTED) {
-                    entry.releaseDroppedTask();
+                    entry.beginContainerHandling();
+                    try {
+                        entry.releaseDroppedTask();
+                    } finally {
+                        entry.completeContainerHandling(this);
+                    }
                     continue;
                 }
-                if (!this.takeStagedEntryForTarget(entry, context, context.stagingCursor.sequence())) continue;
-                this.executeEntry(entry, context.stagingCursor.sequence(), null, tunnel);
+                entry.beginContainerHandling();
+                try {
+                    if (!this.takeStagedEntryForTarget(entry, context, context.stagingCursor.sequence())) continue;
+                    this.executeHandledEntry(entry, context.stagingCursor.sequence(), null, tunnel);
+                } finally {
+                    entry.completeContainerHandling(this);
+                }
             }
             if (context.stagingQueue.consumerBoundary() < context.stagingBoundary) return progressed;
             if (context.stagingCount.get() != 0) return progressed;
@@ -3083,10 +3693,10 @@ public final class Partition {
         /**
          * 业务作用：安全撤销归还时把 staging 所有权转回目标盗洞，先增目标计数再减暂存计数。
          *
-         * @param entry staging 唯一 consumer 取得的任务
-         * @param context 本次撤销归还上下文
+         * @param entry    staging 唯一 consumer 取得的任务
+         * @param context  本次撤销归还上下文
          * @param sequence staging 槽位序号
-         * 返回: 成功接管且仍需执行时返回 true；取消或故障时返回 false。
+         *                 返回: 成功接管且仍需执行时返回 true；取消或故障时返回 false。
          */
         boolean takeStagedEntryForTarget(TaskEntry entry, StrictReturnContext context, long sequence) {
             StrictTunnel tunnel = context.tunnel;
@@ -3124,10 +3734,10 @@ public final class Partition {
         /**
          * 业务作用：按盗洞 FIFO 把归还边界内旧任务发布到原始主队列，先增源计数、发布成功后再减目标计数。
          *
-         * @param entry 目标 worker 从盗洞取得的旧严格任务
-         * @param context 本类型独占归还上下文
+         * @param entry    目标 worker 从盗洞取得的旧严格任务
+         * @param context  本类型独占归还上下文
          * @param sequence 盗洞增量队列槽位序号
-         * 返回: 转移成功或任务已取消时返回 true；不可恢复发布失败时冻结类型并返回 false。
+         *                 返回: 转移成功或任务已取消时返回 true；不可恢复发布失败时冻结类型并返回 false。
          */
         boolean moveStrictReturnEntry(TaskEntry entry, StrictReturnContext context, long sequence) {
             TypeState sourceCounter = context.typeState;
@@ -3159,9 +3769,11 @@ public final class Partition {
                     entry.releaseDroppedTask();
                     return true;
                 }
+                int retention = entry.prepareContainerPublish();
                 try {
                     context.tunnel.source.queue.offer(entry);
                 } catch (Throwable failure) {
+                    entry.rollbackContainerPublish(retention);
                     if (entry.state() == TaskEntry.CANCELLED) {
                         context.tunnel.decrement();
                         entry.releaseDroppedTask();
@@ -3192,13 +3804,36 @@ public final class Partition {
         /**
          * 业务作用：为一笔已离开主队列的任务取得唯一执行权，严格类型还必须占有当前 LOCAL executionGate。
          *
-         * @param entry 已由唯一 consumer 物理摘除的任务条目
-         * @param sequence 该任务所在物理队列的槽位序号
-         * @param tunnel 非严格盗洞任务的物理来源；主队列任务为 null
+         * @param entry        已由唯一 consumer 物理摘除的任务条目
+         * @param sequence     该任务所在物理队列的槽位序号
+         * @param tunnel       非严格盗洞任务的物理来源；主队列任务为 null
          * @param strictTunnel 严格盗洞任务的物理来源；其他队列为 null
-         * 返回: 无返回值；取消条目直接跳过，失去门禁的条目登记为 FAILED 证据。
+         *                     返回: 无返回值；取消条目直接跳过，失去门禁的条目登记为 FAILED 证据。
          */
         void executeEntry(
+                TaskEntry entry,
+                long sequence,
+                NonStrictTunnel tunnel,
+                StrictTunnel strictTunnel
+        ) {
+            entry.beginContainerHandling();
+            try {
+                this.executeHandledEntry(entry, sequence, tunnel, strictTunnel);
+            } finally {
+                entry.completeContainerHandling(this);
+            }
+        }
+
+        /**
+         * 业务作用：在调用方持有物理处理权期间执行一笔分区任务的路由、迁移、门禁和业务终态逻辑。
+         *
+         * @param entry        已由唯一 consumer 取得处理权的任务条目
+         * @param sequence     任务原物理槽位序号
+         * @param tunnel       非严格盗洞物理来源；主队列任务为 null
+         * @param strictTunnel 严格盗洞物理来源；其他任务为 null
+         *                     返回: 无返回值；物理持有的解除和 FAILED 收口登记由外层 executeEntry 统一完成。
+         */
+        private void executeHandledEntry(
                 TaskEntry entry,
                 long sequence,
                 NonStrictTunnel tunnel,
@@ -3218,8 +3853,8 @@ public final class Partition {
 
             TypeState typeState = entry.typeState;
             if (typeState.failed.get()) {
-                // 类型门禁已经关闭，主队列中迟到摘除的任务只能登记证据，继续执行会越过已冻结的控制边界。
-                if (entry.publishFailed("任务类型已经 FAILED")) this.failedEvidence.offer(entry);
+                // 类型门禁已经关闭，主队列中迟到摘除的任务只能发布未执行终态，继续执行会越过控制边界。
+                entry.publishFailed("任务类型已经 FAILED");
                 return;
             }
             if (!typeState.strictOrder && tunnel == null) {
@@ -3248,7 +3883,7 @@ public final class Partition {
                             this.freezeEntry(entry, "RETURNING 取得未登记归还任务，sequence=" + sequence);
                             return;
                         }
-                        context.returnPending.addLast(entry);
+                        this.retainPrivateEntry(context.returnPending, entry);
                         return;
                     }
                     if (route.state == StrictRouteState.LOCAL_CATCHUP) {
@@ -3258,11 +3893,11 @@ public final class Partition {
                             return;
                         }
                         if (sequence >= context.localBoundary) {
-                            context.postReturnPending.addLast(entry);
+                            this.retainPrivateEntry(context.postReturnPending, entry);
                         } else if (!context.returnPending.isEmpty()) {
-                            context.returnPending.addLast(entry);
+                            this.retainPrivateEntry(context.returnPending, entry);
                         } else {
-                            this.executeCatchupEntry(entry, context, "localBoundary");
+                            this.executeHandledCatchupEntry(entry, context, "localBoundary");
                         }
                         return;
                     }
@@ -3272,7 +3907,7 @@ public final class Partition {
                     }
                     if (route.state != StrictRouteState.LOCAL
                             || !route.executionGate.compareAndSet(GATE_IDLE, GATE_RUNNING)) {
-                        // 任务已经离开共享队列，不能重新 offer 到队尾；保留条目并冻结本类型等待受控恢复。
+                        // 任务已经离开共享队列，不能重新 offer 到队尾；发布失败终态后由当前处理栈移交清理责任。
                         this.freezeEntry(entry, "严格类型未取得 LOCAL executionGate，sequence=" + sequence);
                         return;
                     }
@@ -3323,12 +3958,30 @@ public final class Partition {
         }
 
         /**
+         * 业务作用：把当前 consumer 正在处理的严格任务转交给私有 FIFO，保持失败收口与后续唯一消费互斥。
+         *
+         * @param pending 私有严格顺序队列
+         * @param entry   当前处理栈持有的任务条目
+         *                返回: 无返回值；容器写入失败时恢复原处理权、冻结类型并向上抛出。
+         */
+        void retainPrivateEntry(ArrayDeque<TaskEntry> pending, TaskEntry entry) {
+            int retention = entry.prepareContainerPublish();
+            try {
+                pending.addLast(entry);
+            } catch (Throwable failure) {
+                entry.rollbackContainerPublish(retention);
+                this.freezeEntry(entry, "严格私有 FIFO 发布失败: " + failure.getClass().getSimpleName());
+                throw failure;
+            }
+        }
+
+        /**
          * 业务作用：把原分区唯一 consumer 已取出的非严格任务转移到目标盗洞，取消和发布失败均保持任务可追踪。
          *
-         * @param entry 已离开原始主队列、当前仍为 QUEUED(source) 的任务
-         * @param tunnel 已登记 producer 临界区的目标盗洞
+         * @param entry    已离开原始主队列、当前仍为 QUEUED(source) 的任务
+         * @param tunnel   已登记 producer 临界区的目标盗洞
          * @param sequence 原始主队列槽位序号
-         * 返回: 任务已进入盗洞、已取消或已冻结时返回 true；发布失败且安全恢复本地执行时返回 false。
+         *                 返回: 任务已进入盗洞、已取消或已冻结时返回 true；发布失败且安全恢复本地执行时返回 false。
          */
         boolean moveNonStrictEntry(TaskEntry entry, NonStrictTunnel tunnel, long sequence) {
             tunnel.increment();
@@ -3366,9 +4019,11 @@ public final class Partition {
                     return true;
                 }
 
+                int retention = entry.prepareContainerPublish();
                 try {
                     tunnel.queue.offer(entry);
                 } catch (Throwable failure) {
+                    entry.rollbackContainerPublish(retention);
                     if (tunnel.queue.isFailed()) {
                         tunnel.fail("迁移发布形成永久死槽，sequence=" + tunnel.queue.failureIndex(), failure);
                     }
@@ -3414,94 +4069,111 @@ public final class Partition {
         /**
          * 业务作用：按原始主队列 FIFO 把严格存量任务发布到唯一盗洞存量队列，发布失败后冻结而不回队尾。
          *
-         * @param entry 原分区唯一 consumer 已取得的严格任务
-         * @param tunnel 当前 MIGRATING 路由绑定的严格盗洞
+         * @param entry    原分区唯一 consumer 已取得的严格任务
+         * @param tunnel   当前 MIGRATING 路由绑定的严格盗洞
          * @param sequence 原始主队列槽位序号
-         * 返回: 无返回值；成功后接收方取得逻辑所有权，失败后任务保留为类型级故障证据。
+         *                 返回: 无返回值；成功后接收方取得逻辑所有权，失败后发布未执行终态并交给异步收口。
          */
         void moveStrictEntry(TaskEntry entry, StrictTunnel tunnel, long sequence) {
-            tunnel.increment();
-            if (!entry.beginMove("STRICT_STOCK_TO_TUNNEL", this, tunnel.target, sequence)) {
-                tunnel.decrement();
-                if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
-                return;
-            }
-
+            tunnel.stockInflight.incrementAndGet();
             try {
-                Task task = entry.task();
-                if (task == null || !task.compareAndSetOwner(this.slot, tunnel.target.slot)) {
-                    TaskEntry.STATE.setRelease(entry, TaskEntry.QUEUED);
-                    tunnel.decrement();
-                    if (entry.applyPendingCancel()) {
+                if (tunnel.failed.get()) {
+                    int current = entry.state();
+                    if (current == TaskEntry.CANCELLED || current == TaskEntry.REJECTED) {
                         entry.releaseDroppedTask();
-                        return;
+                    } else {
+                        this.freezeEntry(entry, "严格存量迁移发现盗洞已经 FAILED，sequence=" + sequence);
                     }
-                    tunnel.fail("严格存量迁移所有权 CAS 失败，sequence=" + sequence, entry);
                     return;
                 }
-
-                entry.logicalCounter = tunnel;
-                entry.strictTunnel = tunnel;
-                // 新盗洞建立了新的执行权代次，清除历史归还身份以免未来 RETURNING 误判物理来源。
-                entry.returnContext = null;
-                TaskEntry.STATE.setRelease(entry, TaskEntry.QUEUED);
-                if (entry.applyPendingCancel()) {
-                    // 严格源条目已摘除且未写入 stockQueue，按接收后源顺序补齐两侧计数并回收。
-                    entry.typeState.decrement();
-                    entry.releaseDroppedTask();
+                tunnel.increment();
+                if (!entry.beginMove("STRICT_STOCK_TO_TUNNEL", this, tunnel.target, sequence)) {
+                    tunnel.decrement();
+                    if (entry.state() == TaskEntry.CANCELLED) entry.releaseDroppedTask();
                     return;
                 }
 
                 try {
-                    tunnel.stockQueue.offer(entry);
-                } catch (Throwable failure) {
-                    String reason = "严格存量队列发布失败，sourceSequence=" + sequence
-                            + ", failedSequence=" + tunnel.stockQueue.failureIndex();
-                    if (entry.state() == TaskEntry.CANCELLED) {
-                        // 取消方已经减少目标计数，任务也未进入目标队列；迁移方补减仍保留的源计数。
+                    Task task = entry.task();
+                    if (task == null || !task.compareAndSetOwner(this.slot, tunnel.target.slot)) {
+                        TaskEntry.STATE.setRelease(entry, TaskEntry.QUEUED);
+                        tunnel.decrement();
+                        if (entry.applyPendingCancel()) {
+                            entry.releaseDroppedTask();
+                            return;
+                        }
+                        tunnel.fail("严格存量迁移所有权 CAS 失败，sequence=" + sequence, entry);
+                        return;
+                    }
+
+                    entry.logicalCounter = tunnel;
+                    entry.strictTunnel = tunnel;
+                    // 新盗洞建立了新的执行权代次，清除历史归还身份以免未来 RETURNING 误判物理来源。
+                    entry.returnContext = null;
+                    TaskEntry.STATE.setRelease(entry, TaskEntry.QUEUED);
+                    if (entry.applyPendingCancel()) {
+                        // 严格源条目已摘除且未写入 stockQueue，按接收后源顺序补齐两侧计数并回收。
                         entry.typeState.decrement();
                         entry.releaseDroppedTask();
-                    } else {
-                        tunnel.decrement();
-                        entry.logicalCounter = entry.typeState;
-                        entry.strictTunnel = null;
-                        TaskEntry.STATE.setRelease(entry, TaskEntry.QUEUED);
+                        return;
                     }
-                    try {
-                        tunnel.fail(reason, entry);
-                    } finally {
-                        // 盗洞可能已由并发故障置为 failed 并让 fail() 短路；已脱离两侧队列的任务仍须独立发布终态。
-                        if (entry.state() == TaskEntry.QUEUED) this.freezeEntry(entry, reason);
-                    }
-                    return;
-                }
 
-                // 接收队列发布完成后再减少源计数，控制面最多观察到保守双计，不会提前归零。
-                entry.typeState.decrement();
-                tunnel.target.wakeWorker();
+                    int retention = entry.prepareContainerPublish();
+                    try {
+                        tunnel.stockQueue.offer(entry);
+                    } catch (Throwable failure) {
+                        entry.rollbackContainerPublish(retention);
+                        String reason = "严格存量队列发布失败，sourceSequence=" + sequence
+                                + ", failedSequence=" + tunnel.stockQueue.failureIndex();
+                        if (entry.state() == TaskEntry.CANCELLED) {
+                            // 取消方已经减少目标计数，任务也未进入目标队列；迁移方补减仍保留的源计数。
+                            entry.typeState.decrement();
+                            entry.releaseDroppedTask();
+                        } else {
+                            tunnel.decrement();
+                            entry.logicalCounter = entry.typeState;
+                            entry.strictTunnel = null;
+                            TaskEntry.STATE.setRelease(entry, TaskEntry.QUEUED);
+                        }
+                        try {
+                            tunnel.fail(reason, entry);
+                        } finally {
+                            // 盗洞可能已由并发故障置为 failed 并让 fail() 短路；脱离两侧队列的任务仍须发布终态。
+                            if (entry.state() == TaskEntry.QUEUED) this.freezeEntry(entry, reason);
+                        }
+                        return;
+                    }
+
+                    // 接收队列发布完成后再减少源计数，控制面最多观察到保守双计，不会提前归零。
+                    entry.typeState.decrement();
+                    tunnel.target.wakeWorker();
+                } finally {
+                    entry.finishMove();
+                }
             } finally {
-                entry.finishMove();
+                int remaining = tunnel.stockInflight.decrementAndGet();
+                if (remaining == 0 && tunnel.failed.get()) tunnel.target.wakeWorker();
             }
         }
 
         /**
          * 业务作用：把已经离开公共队列但无法安全执行的任务登记为未执行证据，禁止静默丢失或尾部重排。
          *
-         * @param entry 无法继续推进的任务条目
+         * @param entry  无法继续推进的任务条目
          * @param reason 冻结原因
-         * 返回: 无返回值；严格类型同时发布类型级 FAILED。
+         *               返回: 无返回值；严格类型同时发布类型级 FAILED。
          */
         void freezeEntry(TaskEntry entry, String reason) {
             this.failType(entry.typeState, reason, entry);
         }
 
         /**
-         * 业务作用：关闭单个任务类型的执行与新入队，并保留已脱离公共队列的任务引用作为恢复证据。
+         * 业务作用：关闭单个任务类型的执行与新入队，并把已脱离公共队列的任务发布为可观察失败终态。
          *
          * @param typeState 失去安全推进条件的类型状态
-         * @param reason 故障原因
-         * @param evidence 已脱离队列的任务；没有时可为 null
-         * 返回: 无返回值；其他不依赖本类型专属状态的类型仍可继续。
+         * @param reason    故障原因
+         * @param evidence  已脱离队列的任务；没有时可为 null
+         *                  返回: 无返回值；其他不依赖本类型专属状态的类型仍可继续。
          */
         void failType(TypeState typeState, String reason, TaskEntry evidence) {
             typeState.failed.set(true);
@@ -3526,7 +4198,7 @@ public final class Partition {
                 }
                 if (failedTunnel != null && failedTunnel.failed.compareAndSet(false, true)) {
                     failedTunnel.failureReason = reason;
-                    // 类型路由冻结后同步撤销目标执行权，保留两个严格 FIFO 作为恢复证据。
+                    // 类型路由冻结后同步撤销目标执行权，由目标 worker 等 producer 退出后清空两个严格 FIFO。
                     failedTunnel.target.inboundStrictTunnels.remove(failedTunnel);
                     failedTunnel.target.failedStrictTunnels.offer(failedTunnel);
                     failedTunnel.target.wakeWorker();
@@ -3538,8 +4210,11 @@ public final class Partition {
                     tunnel.fail("任务类型 FAILED: " + reason, null);
                 }
             }
-            if (evidence != null && evidence.publishFailed(reason)) {
-                this.failedEvidence.offer(evidence);
+            if (evidence != null) evidence.publishFailed(reason);
+            if (typeState.strictOrder && typeState.failureCleanupQueued.compareAndSet(false, true)) {
+                // 严格路由可能同时持有盗洞、staging 与两个私有 FIFO，由源 worker 在目标撤权完成后统一断链。
+                typeState.source.failedTypeRetentions.offer(typeState);
+                typeState.source.wakeWorker();
             }
             log.error("Partition slot {} taskType {} FAILED: {}", this.slot, typeState.taskType, reason);
         }
@@ -3547,9 +4222,9 @@ public final class Partition {
         /**
          * 业务作用：发布共享原队列/worker 的分区级故障门禁，立即拒绝该原始分区的全部新提交。
          *
-         * @param reason 稳定故障原因
+         * @param reason  稳定故障原因
          * @param failure 原始异常；没有异常对象时为 null
-         * 返回: 无返回值；首次失败计入全局失败分区数，后续调用只补充日志。
+         *                返回: 无返回值；首次失败计入本 Runner 失败分区数，后续调用只补充日志。
          */
         void failSlot(String reason, Throwable failure) {
             this.failureReason = reason;
@@ -3559,6 +4234,8 @@ public final class Partition {
                 if (current.phase == SlotPhase.FAILED) break;
                 SlotLifecycle failed = new SlotLifecycle(this.lifecycleEpoch.incrementAndGet(), SlotPhase.FAILED);
                 if (this.lifecycle.compareAndSet(current, failed)) {
+                    // 保存被关闭代次的 producer 计数，清理线程必须等其归零后才能跨死槽摘除已发布任务。
+                    this.failedPredecessor.set(current);
                     newlyFailed = true;
                     break;
                 }
@@ -3574,17 +4251,29 @@ public final class Partition {
                 for (StrictTunnel tunnel : this.inboundStrictTunnels.keySet()) {
                     tunnel.fail("目标分区 worker/共享队列失效: " + reason, null);
                 }
+                // 源 worker 已经失去推进能力，必须同步关闭全部出站通道，否则远端队列和严格归还上下文会永久引用本槽位。
+                for (TypeState typeState : this.typeStates.values()) {
+                    if (typeState.strictOrder) {
+                        StrictTunnel tunnel = typeState.strictRoute.get().tunnel;
+                        if (tunnel != null) tunnel.fail("原始分区 worker/共享队列失效: " + reason, null);
+                    } else {
+                        for (NonStrictTunnel tunnel : typeState.nonStrictGroup.route.get().tunnels) {
+                            tunnel.fail("原始分区 worker/共享队列失效: " + reason, failure);
+                        }
+                    }
+                }
             }
             if (failure == null) {
                 log.error("Partition slot {} FAILED: {}", this.slot, reason);
             } else {
                 log.error("Partition slot {} FAILED: {}", this.slot, reason, failure);
             }
+            this.wakeWorker();
         }
 
         /**
          * 业务作用：停机时先替换分区提交代次，确保迟到 producer 复验失败后不再写入即将停止的队列。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；FAILED 槽位保持 FAILED，不覆盖故障证据。
          */
@@ -3604,7 +4293,7 @@ public final class Partition {
 
         /**
          * 业务作用：请求唯一 consumer 在排空健康队列后退出，并显式唤醒可能 park 的 worker。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；重复请求保持幂等。
          */
@@ -3620,7 +4309,7 @@ public final class Partition {
 
         /**
          * 业务作用：判断本槽位作为源分区的严格盗洞是否仍依赖源 worker 推进，防止停机时源先于目标退出。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 任一未失败严格盗洞仍登记在目标入站集合时返回 true；目标已经排空并摘除后返回 false。
          */
@@ -3638,7 +4327,7 @@ public final class Partition {
 
         /**
          * 业务作用：判断本槽位是否持有只能由其唯一 worker 推进的严格声明、迁移或归还状态。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 存在未发布 MigrationClaim 或仍登记目标执行权的严格盗洞时返回 true。
          */
@@ -3657,10 +4346,10 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：等待本槽位 worker 完成排空或故障退出，给全局生命周期提供停止证明。
+         * 业务作用：等待本槽位 worker 完成排空或故障退出，给 Runner 生命周期提供停止证明。
          *
          * @param timeoutMillis 最长等待毫秒数
-         * 返回: worker 已退出返回 true；超时或线程被中断返回 false。
+         *                      返回: worker 已退出返回 true；超时或线程被中断返回 false。
          */
         boolean awaitStopped(long timeoutMillis) {
             try {
@@ -3673,7 +4362,7 @@ public final class Partition {
 
         /**
          * 业务作用：发布 PARKED 后二次检查队头，消除 producer 在 park 边界发布任务造成的丢唤醒窗口。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；任何新任务、故障或停机唤醒都会使 worker 重新检查控制状态。
          */
@@ -3694,6 +4383,12 @@ public final class Partition {
                 this.signal.set(0);
                 return;
             }
+            if (this.hasFailureRetentions()) {
+                // 跨 worker 撤权或迟到 producer 尚未归零时短暂退避；无限期 park 会让故障强引用永远得不到复验。
+                this.signal.set(0);
+                LockSupport.parkNanos(this, STOP_DRAIN_PARK_NANOS);
+                return;
+            }
             if (this.inboundNonStrictTunnels.isEmpty() && this.inboundStrictTunnels.isEmpty()) {
                 // 远端热点由集中观察者发现并发布控制请求；本 worker 无限期休眠可消除每分区定时唤醒，
                 // 本地任务、停机和控制交接仍通过 signal + unpark 保证不会丢失业务推进责任。
@@ -3707,7 +4402,7 @@ public final class Partition {
 
         /**
          * 业务作用：二次检查任一入站盗洞是否已有可消费或故障槽位，避免 worker 在盗洞任务已到达时误 park。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 至少一个盗洞需要 consumer 推进时返回 true。
          */
@@ -3722,7 +4417,7 @@ public final class Partition {
 
         /**
          * 业务作用：检查严格盗洞的存量或已开放增量队列，避免目标 worker 在迁移任务已发布时误 park。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 至少一个严格盗洞存在可推进槽位或迁移完成信号时返回 true。
          */
@@ -3743,7 +4438,7 @@ public final class Partition {
 
         /**
          * 业务作用：在 producer 发布任务或控制面交接责任后唤醒唯一 consumer，避免依赖偶然业务流量推进。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；unpark permit 可安全早于实际 park 到达。
          */
@@ -3758,7 +4453,7 @@ public final class Partition {
          * 业务作用：把稳定分区故障原因拼接到提交拒绝信息，便于调用方定位原始故障域。
          *
          * @param fallback 尚未记录具体原因时使用的说明
-         * 返回: 已记录故障时返回故障原因，否则返回 fallback。
+         *                 返回: 已记录故障时返回故障原因，否则返回 fallback。
          */
         String failureReason(String fallback) {
             String reason = this.failureReason;
@@ -3778,9 +4473,9 @@ public final class Partition {
         /**
          * 业务作用：绑定一笔内部任务条目的不可变借出代次，建立稳定的调用方观察边界。
          *
-         * @param entry 本次提交唯一对应的池化条目
+         * @param entry      本次提交唯一对应的池化条目
          * @param generation 条目本次借出的代次
-         * 返回: 构造后句柄保持活动，直到 recycle/close 首次释放。
+         *                   返回: 构造后句柄保持活动，直到 recycle/close 首次释放。
          */
         SubmissionHandle(TaskEntry entry, long generation) {
             this.entry = entry;
@@ -3789,7 +4484,7 @@ public final class Partition {
 
         /**
          * 业务作用：读取本提交当前生命周期，并保证释放边界不会与本次读取并发穿透到下一代任务。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本代内部条目的权威公开状态；句柄已经释放或代次失配时抛出 IllegalStateException。
          */
@@ -3805,7 +4500,7 @@ public final class Partition {
 
         /**
          * 业务作用：只针对本句柄绑定的任务竞争取消权，禁止旧引用影响复用后的新任务。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本代任务在执行前成功转为 CANCELLED 时返回 true；其他终态返回 false。
          */
@@ -3821,7 +4516,7 @@ public final class Partition {
 
         /**
          * 业务作用：读取本提交的拒绝或冻结原因，不允许释放后的旧引用观察新任务诊断字段。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本代 REJECTED/FAILED 的稳定原因；其他状态通常返回 null，句柄失效时抛异常。
          */
@@ -3832,7 +4527,7 @@ public final class Partition {
 
         /**
          * 业务作用：一次性释放调用方对本代条目的外部持有，使物理收口后的内部条目可以安全归池。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；重复释放幂等，新访问与释放门禁互斥，已经取得临时 hold 的状态读取或取消可在
          * 本方法返回后继续完成且不会穿透到复用后的条目。
@@ -3849,7 +4544,7 @@ public final class Partition {
 
         /**
          * 业务作用：复验句柄仍绑定原借出代次，作为所有公开读写操作的统一 ABA 门禁。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 当前代内部条目；句柄已释放或内部代次异常变化时抛出 IllegalStateException。
          */
@@ -3863,7 +4558,7 @@ public final class Partition {
 
         /**
          * 业务作用：在句柄释放门禁内取得本代条目并增加临时访问 hold，使后续慢操作可安全移出 monitor。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本代仍活动的内部条目；并发 close 胜出时抛出 IllegalStateException。
          */
@@ -3889,8 +4584,15 @@ public final class Partition {
         static final int FAILED = 7;
         static final int DELAYED = 8;
         static final int RELEASED = 9;
-        /** 终态所有者及其副作用尚未发布完成，任何 consumer 都不得执行或释放业务任务。 */
+        /**
+         * 终态所有者及其副作用尚未发布完成，任何 consumer 都不得执行或释放业务任务。
+         */
         static final int TERMINATING = 10;
+        private static final int RETENTION_DETACHED = 0;
+        private static final int RETENTION_CONTAINER = 1;
+        private static final int RETENTION_HANDLING = 2;
+        private static final int RETENTION_FAILURE_QUEUED = 3;
+        private static final int RETENTION_FAILURE_HANDLING = 4;
 
         private static final VarHandle STATE;
         private static final VarHandle TASK;
@@ -3902,6 +4604,8 @@ public final class Partition {
         private static final VarHandle RECYCLE_TOKEN;
         private static final VarHandle RELEASE_REQUESTED;
         private static final VarHandle TERMINAL_STALL_REPORTED;
+        private static final VarHandle RETENTION_STATE;
+        private static final VarHandle FAILURE_CLEANUP_QUEUED;
 
         static {
             try {
@@ -3932,6 +4636,12 @@ public final class Partition {
                         "terminalStallReported",
                         boolean.class
                 );
+                RETENTION_STATE = lookup.findVarHandle(TaskEntry.class, "retentionState", int.class);
+                FAILURE_CLEANUP_QUEUED = lookup.findVarHandle(
+                        TaskEntry.class,
+                        "failureCleanupQueued",
+                        boolean.class
+                );
             } catch (ReflectiveOperationException failure) {
                 throw new ExceptionInInitializerError(failure);
             }
@@ -3946,8 +4656,12 @@ public final class Partition {
         private volatile boolean frameworkReleased;
         private volatile boolean releaseRequested;
         private volatile boolean terminalStallReported;
+        private volatile int retentionState;
+        private volatile boolean failureCleanupQueued;
         private volatile int recycleHolds;
-        /** 高位为本对象借出代次，低位 1 表示本代已经提交归池，阻止并发双归还跨越下一次借出。 */
+        /**
+         * 高位为本对象借出代次，低位 1 表示本代已经提交归池，阻止并发双归还跨越下一次借出。
+         */
         private volatile long recycleToken;
         private volatile int keyHash;
         private volatile String delayUnique;
@@ -3964,24 +4678,30 @@ public final class Partition {
         private volatile String moveStage;
         private volatile long moveRecycleGeneration = -1L;
         private boolean moveAuditSlotsRegistered;
+        /**
+         * 条目始终归属创建它的分区 Runner，池化复用不能改变跨场景控制状态的归属。
+         */
+        private final Partition partition;
         private final ObjectPool.PooledHandle<TaskEntry> handle;
 
         /**
          * 业务作用：创建尚未路由的稳定提交条目，在明确受理结果前由提交线程独占初始化。
          *
-         * @param pool 所属 TaskEntry 对象池
-         * 返回: 构造完成后仅持有稳定对象池 handle，业务字段由每次借出初始化。
+         * @param partition 所属分区 Runner 的内部实现
+         * @param pool      所属 TaskEntry 对象池
+         *                  返回: 构造完成后仅持有稳定对象池 handle，业务字段由每次借出初始化。
          */
-        TaskEntry(ObjectPool<TaskEntry> pool) {
+        TaskEntry(Partition partition, ObjectPool<TaskEntry> pool) {
+            this.partition = partition;
             this.handle = new ObjectPool.PooledHandle<>(pool);
         }
 
         /**
          * 业务作用：初始化一次对象池借出代次，绑定业务任务和自动释放策略并建立框架基础 hold。
          *
-         * @param task 本次提交的业务任务
+         * @param task        本次提交的业务任务
          * @param autoRecycle fire-and-forget 入口无需稳定句柄时为 true
-         * 返回: 无返回值；初始化后状态为 ENQUEUEING，回收代次严格单调增加。
+         *                    返回: 无返回值；初始化后状态为 ENQUEUEING，回收代次严格单调增加。
          */
         void initialize(Task task, boolean autoRecycle) {
             long previous = (long) RECYCLE_TOKEN.getAcquire(this);
@@ -3993,11 +4713,13 @@ public final class Partition {
             this.frameworkReleased = false;
             this.releaseRequested = autoRecycle;
             this.terminalStallReported = false;
+            this.retentionState = RETENTION_DETACHED;
+            this.failureCleanupQueued = false;
         }
 
         /**
          * 业务作用：取得本次借出的稳定代次，供不可池化 SubmissionHandle 建立 ABA 防护。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 当前 recycleToken 的借出代次；不包含低位归池提交标记。
          */
@@ -4009,7 +4731,7 @@ public final class Partition {
          * 业务作用：复验内部条目仍属于指定提交代次，防止公开旧句柄读写复用后的新任务。
          *
          * @param generation SubmissionHandle 构造时记录的借出代次
-         * 返回: 条目仍为该代且尚未提交归池时返回 true。
+         *                   返回: 条目仍为该代且尚未提交归池时返回 true。
          */
         boolean matchesRecycleGeneration(long generation) {
             return (long) RECYCLE_TOKEN.getAcquire(this) == generation << 1;
@@ -4017,7 +4739,7 @@ public final class Partition {
 
         /**
          * 业务作用：为仍可能回调本条目的外部包装增加回收 hold，禁止业务条目先于包装归池。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本次条目借出代次，包装释放时必须携带同一代次归还 hold。
          */
@@ -4031,7 +4753,7 @@ public final class Partition {
          * 业务作用：释放定时包装等外部持有者的回收 hold，并在调用方已释放时尝试归池。
          *
          * @param generation 建立 hold 时记录的条目借出代次
-         * 返回: 无返回值；代次不匹配的迟到释放被忽略，不能影响已复用的新任务。
+         *                   返回: 无返回值；代次不匹配的迟到释放被忽略，不能影响已复用的新任务。
          */
         void releaseRecycleHold(long generation) {
             long token = (long) RECYCLE_TOKEN.getAcquire(this);
@@ -4047,7 +4769,7 @@ public final class Partition {
 
         /**
          * 业务作用：由唯一物理收口路径释放框架基础 hold，证明条目不再被任何任务队列或注册表使用。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；并发或重复收口只允许第一次减少 hold。
          */
@@ -4062,11 +4784,12 @@ public final class Partition {
          * 业务作用：原子提交本代唯一归池动作，代次戳避免并发双归还越过对象池重新借出边界。
          *
          * @param generation 发起释放时观测到的条目借出代次
-         * 返回: 无返回值；只有调用方已释放且所有框架 hold 为零时执行实际 ObjectPool.recycle。
+         *                   返回: 无返回值；只有调用方已释放、所有框架 hold 为零且物理处理权已解除时执行实际归池。
          */
         void tryRecycle(long generation) {
             if (!(boolean) RELEASE_REQUESTED.getAcquire(this)
-                    || (int) RECYCLE_HOLDS.getAcquire(this) != 0) return;
+                    || (int) RECYCLE_HOLDS.getAcquire(this) != 0
+                    || (int) RETENTION_STATE.getAcquire(this) != RETENTION_DETACHED) return;
             long expected = generation << 1;
             if (!RECYCLE_TOKEN.compareAndSet(this, expected, expected | 1L)) return;
             ObjectPool.Recycler.super.recycle();
@@ -4074,9 +4797,9 @@ public final class Partition {
 
         /**
          * 业务作用：暴露稳定池化 handle，以 CAS 防止同一借出代次被重复放入 TaskEntry 对象池。
-         *
+         * <p>
          * 参数说明: 无。
-         * 返回: 构造时绑定全局 TaskEntryPool 的 handle。
+         * 返回: 构造时绑定本 Runner TaskEntryPool 的 handle。
          */
         @Override
         public ObjectPool.PooledHandle<TaskEntry> handle() {
@@ -4087,7 +4810,7 @@ public final class Partition {
          * 业务作用：由稳定外部句柄声明调用方已放弃本代观察权，等待框架物理引用全部释放后归池。
          *
          * @param generation 外部句柄创建时记录的条目借出代次
-         * 返回: 无返回值；代次失配或本代已经提交归池时静默忽略，不能影响复用后的新任务。
+         *                   返回: 无返回值；代次失配或本代已经提交归池时静默忽略，不能影响复用后的新任务。
          */
         void releaseSubmission(long generation) {
             long token = (long) RECYCLE_TOKEN.getAcquire(this);
@@ -4098,7 +4821,7 @@ public final class Partition {
 
         /**
          * 业务作用：归池前清空所有任务、路由、上下文和迁移引用，保留 handle 与递增回收代次。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；执行后旧句柄进入 RELEASED，直到下一次对象池借出重新初始化。
          */
@@ -4113,6 +4836,8 @@ public final class Partition {
             this.frameworkReleased = false;
             this.releaseRequested = false;
             this.terminalStallReported = false;
+            this.retentionState = RETENTION_DETACHED;
+            this.failureCleanupQueued = false;
             this.recycleHolds = 0;
             this.keyHash = 0;
             this.delayUnique = null;
@@ -4133,7 +4858,7 @@ public final class Partition {
 
         /**
          * 业务作用：在提交线程捕获一次跨线程上下文，立即和延迟路径都复用该快照而不读取 worker 上下文。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 捕获成功返回 true；异常时发布 REJECTED、释放任务并返回 false。
          */
@@ -4151,8 +4876,8 @@ public final class Partition {
          * 业务作用：发布尚无分区所有权的 DELAYED 状态，并保存到期时重新计算路由所需的 hash 和定时标识。
          *
          * @param keyHash 到期时使用的原始路由 hash
-         * @param unique TimingWheel 惰性取消标识
-         * 返回: 无返回值；只允许延迟提交线程在安装定时回调前调用一次。
+         * @param unique  TimingWheel 惰性取消标识
+         *                返回: 无返回值；只允许延迟提交线程在安装定时回调前调用一次。
          */
         void publishDelayed(int keyHash, String unique) {
             this.keyHash = keyHash;
@@ -4162,7 +4887,7 @@ public final class Partition {
 
         /**
          * 业务作用：由到期回调竞争 DELAYED 到 ENQUEUEING，确保取消、停机和到期至多一个路径取得任务引用。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本次回调取得到期路由权时返回 true。
          */
@@ -4174,7 +4899,7 @@ public final class Partition {
          * 业务作用：在延迟任务尚未到期时发布明确拒绝，并只释放一次上下文和业务任务。
          *
          * @param reason 取消登记或停机拒绝原因
-         * 返回: 本次成功把 DELAYED 发布为 REJECTED 时返回 true。
+         *               返回: 本次成功把 DELAYED 发布为 REJECTED 时返回 true。
          */
         boolean rejectDelayed(String reason) {
             this.rejectionReason = reason;
@@ -4188,7 +4913,7 @@ public final class Partition {
 
         /**
          * 业务作用：读取尚未释放的业务任务引用，仅允许提交线程或已取得 RUNNING 的 worker 使用。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 当前业务任务；终态释放后可能为 null。
          */
@@ -4199,13 +4924,13 @@ public final class Partition {
         /**
          * 业务作用：在发布 QUEUED 前绑定唯一原始分区、类型状态和跨线程上下文。
          *
-         * @param source 原始分区槽位
-         * @param typeState 已原子注册的类型策略
-         * @param context 提交线程上下文快照；上下文为空时为 null
-         * @param logicalCounter 当前逻辑所有者的精确计数器
+         * @param source          原始分区槽位
+         * @param typeState       已原子注册的类型策略
+         * @param context         提交线程上下文快照；上下文为空时为 null
+         * @param logicalCounter  当前逻辑所有者的精确计数器
          * @param nonStrictTunnel 当前落点是非严格盗洞时的引用；原始队列为 null
-         * @param strictTunnel 当前落点是严格盗洞时的引用；其他队列为 null
-         * 返回: 无返回值；绑定完成后这些控制字段在本次对象池借出生命周期内保持稳定。
+         * @param strictTunnel    当前落点是严格盗洞时的引用；其他队列为 null
+         *                        返回: 无返回值；绑定完成后这些控制字段在本次对象池借出生命周期内保持稳定。
          */
         void bind(
                 PartitionSlot source,
@@ -4224,8 +4949,169 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：以 release 语义发布任务已经拥有逻辑计数并即将进入唯一队列。
+         * 业务作用：在条目发布到任务容器前把清理权从当前处理者转交给该容器，阻止失败收口越过物理引用。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 转交前的持有状态；发布失败时必须携带该值调用 rollbackContainerPublish。
+         */
+        int prepareContainerPublish() {
+            int previous = (int) RETENTION_STATE.getAcquire(this);
+            if (previous != RETENTION_DETACHED && previous != RETENTION_HANDLING) {
+                throw new IllegalStateException("Partition task already belongs to a physical container");
+            }
+            if (!RETENTION_STATE.compareAndSet(this, previous, RETENTION_CONTAINER)) {
+                throw new IllegalStateException("Partition task physical retention changed during publication");
+            }
+            return previous;
+        }
+
+        /**
+         * 业务作用：在物理发布未成功时把清理权归还给原处理者，避免不存在的容器永久阻塞资源收口。
          *
+         * @param previous prepareContainerPublish 返回的原持有状态
+         *                 返回: 无返回值；若容器已经被 consumer 取得则保持其新状态，不能覆盖真实所有权。
+         */
+        void rollbackContainerPublish(int previous) {
+            RETENTION_STATE.compareAndSet(this, RETENTION_CONTAINER, previous);
+        }
+
+        /**
+         * 业务作用：由物理容器唯一 consumer 取得条目处理权，使处理结束前失败收口不能释放业务对象。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 无返回值；条目不再由唯一物理容器持有时抛出异常，阻止重复 consumer 或跨容器处理。
+         */
+        void beginContainerHandling() {
+            int current = (int) RETENTION_STATE.getAcquire(this);
+            if (current != RETENTION_CONTAINER
+                    || !RETENTION_STATE.compareAndSet(this, RETENTION_CONTAINER, RETENTION_HANDLING)) {
+                throw new IllegalStateException("Partition task has no physical container ownership");
+            }
+        }
+
+        /**
+         * 业务作用：在当前处理栈结束时把物理持有直接转交给失败收口队列，或安全解除普通条目的持有。
+         *
+         * @param cleanupSlot 当前处理栈所属分区槽位
+         *                    返回: 无返回值；FAILED 条目在入队前已取得收口持有，不存在可并发归池的 DETACHED 窗口。
+         */
+        void completeContainerHandling(PartitionSlot cleanupSlot) {
+            if (this.state() == FAILED
+                    && RETENTION_STATE.compareAndSet(
+                    this,
+                    RETENTION_HANDLING,
+                    RETENTION_FAILURE_QUEUED
+            )) {
+                this.publishFailureCleanup(cleanupSlot);
+                return;
+            }
+            if (RETENTION_STATE.compareAndSet(this, RETENTION_HANDLING, RETENTION_DETACHED)) {
+                if (this.state() == FAILED && this.enqueueFailureCleanup(cleanupSlot)) return;
+                // 业务终态可能已经释放框架 hold；解除物理持有后补做归池复验，此后不得再访问本条目。
+                this.tryRecycle(this.recycleGeneration());
+            }
+        }
+
+        /**
+         * 业务作用：由已关闭队列的唯一清理者接管物理槽位，使逐笔终态化可以安全解除框架基础持有。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 成功从容器取得独占清理权时返回 true；仍有处理栈或收口队列持有时返回 false。
+         */
+        boolean detachFailedContainer() {
+            int current = (int) RETENTION_STATE.getAcquire(this);
+            if (current == RETENTION_DETACHED) {
+                return RETENTION_STATE.compareAndSet(
+                        this,
+                        RETENTION_DETACHED,
+                        RETENTION_FAILURE_HANDLING
+                );
+            }
+            return current == RETENTION_CONTAINER && RETENTION_STATE.compareAndSet(
+                    this,
+                    RETENTION_CONTAINER,
+                    RETENTION_FAILURE_HANDLING
+            );
+        }
+
+        /**
+         * 业务作用：把已经安全脱离业务容器的 FAILED 条目只登记一次，交给指定 worker 完成资源释放。
+         *
+         * @param cleanupSlot 唯一消费本条失败收口责任的分区槽位
+         *                    返回: 成功转交给收口队列时返回 true；仍由物理容器、处理栈或其它收口者持有时返回 false。
+         */
+        boolean enqueueFailureCleanup(PartitionSlot cleanupSlot) {
+            if (!RETENTION_STATE.compareAndSet(
+                    this,
+                    RETENTION_DETACHED,
+                    RETENTION_FAILURE_QUEUED
+            )) return false;
+            this.publishFailureCleanup(cleanupSlot);
+            return true;
+        }
+
+        /**
+         * 业务作用：把未能立即终结的独占清理权归还收口队列，保留后续重试责任。
+         *
+         * @param cleanupSlot 唯一消费本条失败收口责任的分区槽位
+         *                    返回: 无返回值；只有当前清理者可以归还，队列持有期间始终禁止归池。
+         */
+        void retainFailureCleanup(PartitionSlot cleanupSlot) {
+            if (!RETENTION_STATE.compareAndSet(
+                    this,
+                    RETENTION_FAILURE_HANDLING,
+                    RETENTION_FAILURE_QUEUED
+            )) return;
+            this.publishFailureCleanup(cleanupSlot);
+        }
+
+        /**
+         * 业务作用：在收口队列已取得物理持有后发布唯一强引用，并唤醒对应 worker。
+         *
+         * @param cleanupSlot 唯一消费本条失败收口责任的分区槽位
+         *                    返回: 无返回值；重复发布被原子门禁拒绝。
+         */
+        private void publishFailureCleanup(PartitionSlot cleanupSlot) {
+            if (!FAILURE_CLEANUP_QUEUED.compareAndSet(this, false, true)) return;
+            cleanupSlot.failedEvidence.offer(this);
+            cleanupSlot.wakeWorker();
+        }
+
+        /**
+         * 业务作用：由收口队列唯一 consumer 取得单条清理权，阻止重试登记与当前清理并发。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 取得独占清理权时返回 true；物理所有权不一致时返回 false。
+         */
+        boolean beginFailureCleanupHandling() {
+            // poll 已经摘除队列强引用，先开放后续合法所有者重新登记；物理状态仍阻止对象提前归池。
+            FAILURE_CLEANUP_QUEUED.setRelease(this, false);
+            if (!RETENTION_STATE.compareAndSet(
+                    this,
+                    RETENTION_FAILURE_QUEUED,
+                    RETENTION_FAILURE_HANDLING
+            )) return false;
+            return true;
+        }
+
+        /**
+         * 业务作用：在失败资源已完全终结后解除最后物理持有，并复验无句柄条目的归池条件。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 无返回值；只有当前独占清理者能解除持有，此后不得再访问本条目。
+         */
+        private void completeFailureCleanupHandling() {
+            if (!RETENTION_STATE.compareAndSet(
+                    this,
+                    RETENTION_FAILURE_HANDLING,
+                    RETENTION_DETACHED
+            )) return;
+            this.tryRecycle(this.recycleGeneration());
+        }
+
+        /**
+         * 业务作用：以 release 语义发布任务已经拥有逻辑计数并即将进入唯一队列。
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；只允许提交线程执行一次。
          */
@@ -4235,7 +5121,7 @@ public final class Partition {
 
         /**
          * 业务作用：读取已经完整发布的内部状态，阻止 consumer 越过终态所有者发布窗口释放业务对象。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 非 TERMINATING 的内部状态；超过总时限会冻结所属类型并记录一次故障，但不会伪造发布方终态。
          */
@@ -4262,7 +5148,7 @@ public final class Partition {
          * 业务作用：把长期未完成的终态发布转为可观测类型故障，同时保留原发布者对最终状态的唯一权威。
          *
          * @param waitedNanos 本次调用线程已经等待 TERMINATING 收口的时长
-         * 返回: 无返回值；每个条目借出代次最多报告一次，缺少类型归属时只记录错误。
+         *                    返回: 无返回值；每个条目借出代次最多报告一次，缺少类型归属时只记录错误。
          */
         void reportTerminalStall(long waitedNanos) {
             if (!TERMINAL_STALL_REPORTED.compareAndSet(this, false, true)) return;
@@ -4285,11 +5171,11 @@ public final class Partition {
         /**
          * 业务作用：在任务离开源物理队列后发布内嵌转移描述符，再竞争 MOVING，确保暂停线程仍留下可审计证据。
          *
-         * @param stage 稳定转移阶段名
+         * @param stage      稳定转移阶段名
          * @param moveSource 当前物理摘除方
          * @param moveTarget 计划接收任务的分区
-         * @param sequence 源物理队列槽位序号
-         * 返回: 成功取得本次唯一转移权时返回 true；取消或其他终态先到达时撤销描述符并返回 false。
+         * @param sequence   源物理队列槽位序号
+         *                   返回: 成功取得本次唯一转移权时返回 true；取消或其他终态先到达时撤销描述符并返回 false。
          */
         boolean beginMove(
                 String stage,
@@ -4306,26 +5192,26 @@ public final class Partition {
                 this.moveSequence = sequence;
                 this.moveStartedNanos = System.nanoTime();
                 this.moveFailureRecorded = false;
-                INSTANCE.registerMovingAuditSlots(moveSource, moveTarget);
+                this.partition.registerMovingAuditSlots(moveSource, moveTarget);
                 this.moveAuditSlotsRegistered = true;
-                INSTANCE.movingRegistry.put(this, Boolean.TRUE);
+                this.partition.movingRegistry.put(this, Boolean.TRUE);
                 if (STATE.compareAndSet(this, QUEUED, MOVING)) return true;
-                INSTANCE.movingRegistry.remove(this);
-                INSTANCE.unregisterMovingAuditSlots(moveSource, moveTarget);
+                this.partition.movingRegistry.remove(this);
+                this.partition.unregisterMovingAuditSlots(moveSource, moveTarget);
                 this.moveAuditSlotsRegistered = false;
                 // ConcurrentHashMap 弱一致迭代器可能已经取得 key；等待旧审计者退出后才能解除移动 hold。
-                INSTANCE.awaitMovingAuditGrace();
+                this.partition.awaitMovingAuditGrace();
                 this.clearMoveDescriptor();
                 this.moveRecycleGeneration = -1L;
                 this.releaseRecycleHold(generation);
                 return false;
             } catch (Throwable failure) {
-                INSTANCE.movingRegistry.remove(this);
+                this.partition.movingRegistry.remove(this);
                 if (this.moveAuditSlotsRegistered) {
-                    INSTANCE.unregisterMovingAuditSlots(moveSource, moveTarget);
+                    this.partition.unregisterMovingAuditSlots(moveSource, moveTarget);
                     this.moveAuditSlotsRegistered = false;
                 }
-                INSTANCE.awaitMovingAuditGrace();
+                this.partition.awaitMovingAuditGrace();
                 this.clearMoveDescriptor();
                 this.moveRecycleGeneration = -1L;
                 this.releaseRecycleHold(generation);
@@ -4335,12 +5221,13 @@ public final class Partition {
 
         /**
          * 业务作用：在转移计数、所有权和物理发布全部收口后撤销活动描述符，禁止迟到审计误判已完成任务。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；重复调用保持幂等。
          */
         void finishMove() {
             long generation = this.moveRecycleGeneration;
+            PartitionSlot cleanupSlot = this.moveSource;
             if (this.moveFailureRecorded) {
                 while (true) {
                     int current = this.state();
@@ -4354,21 +5241,22 @@ public final class Partition {
                 }
             }
             this.moveStartedNanos = 0L;
-            INSTANCE.movingRegistry.remove(this);
+            this.partition.movingRegistry.remove(this);
             if (this.moveAuditSlotsRegistered) {
-                INSTANCE.unregisterMovingAuditSlots(this.moveSource, this.moveTarget);
+                this.partition.unregisterMovingAuditSlots(this.moveSource, this.moveTarget);
                 this.moveAuditSlotsRegistered = false;
             }
             // 移动 hold 覆盖注册表弱一致读窗口；grace period 后再清字段并开放对象池复用。
-            INSTANCE.awaitMovingAuditGrace();
+            this.partition.awaitMovingAuditGrace();
             this.clearMoveDescriptor();
             this.moveRecycleGeneration = -1L;
+            if (cleanupSlot != null && this.state() == FAILED) this.enqueueFailureCleanup(cleanupSlot);
             if (generation >= 0L) this.releaseRecycleHold(generation);
         }
 
         /**
          * 业务作用：清除不再活动的转移诊断字段，使稳定提交句柄不会长期持有两侧分区。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；只能在 movingRegistry 摘除后调用。
          */
@@ -4385,7 +5273,7 @@ public final class Partition {
          * 业务作用：对超过总时限的转移只登记一次故障证据，并冻结原始任务类型而不猜测双计窗口。
          *
          * @param reason 转移失败原因
-         * 返回: 本次首次记录故障时返回 true；已有审计者完成记录时返回 false。
+         *               返回: 本次首次记录故障时返回 true；已有审计者完成记录时返回 false。
          */
         boolean failMove(String reason) {
             if (!MOVE_FAILURE_RECORDED.compareAndSet(this, false, true)) return false;
@@ -4394,7 +5282,6 @@ public final class Partition {
             PartitionSlot origin = this.source;
             TypeState type = this.typeState;
             if (origin != null && type != null) {
-                origin.failedEvidence.offer(this);
                 origin.failType(type, detail, null);
             }
             return true;
@@ -4404,7 +5291,7 @@ public final class Partition {
          * 业务作用：由 worker 原子取得本地排队任务的执行权，并复验业务任务所有权没有被外部破坏。
          *
          * @param expectedOwner 当前 worker 的分区号
-         * 返回: QUEUED 到 RUNNING 转换成功且所有者匹配时返回 true。
+         *                      返回: QUEUED 到 RUNNING 转换成功且所有者匹配时返回 true。
          */
         boolean tryStart(int expectedOwner) {
             Task currentTask = this.task();
@@ -4414,7 +5301,7 @@ public final class Partition {
 
         /**
          * 业务作用：在 worker 已取得唯一执行权后恢复提交上下文、隔离业务异常，并发布完成终态。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；无论业务成功或抛错都只减少一次逻辑计数，框架 hold 由外层最后引用点释放。
          */
@@ -4450,7 +5337,7 @@ public final class Partition {
          * 业务作用：在任务尚未获得任何队列所有权时发布明确拒绝，并释放上下文和可回收业务任务。
          *
          * @param reason 稳定拒绝原因
-         * 返回: 无返回值；重复拒绝不会重复执行回收钩子。
+         *               返回: 无返回值；重复拒绝不会重复执行回收钩子。
          */
         void reject(String reason) {
             this.rejectionReason = reason;
@@ -4465,7 +5352,7 @@ public final class Partition {
          * 业务作用：回滚已经增加逻辑计数但未成功进入主队列的任务，发布拒绝后禁止 consumer 执行。
          *
          * @param reason 队列发布失败原因
-         * 返回: 无返回值；只有 QUEUED 终态竞争胜出者减少逻辑计数并发布 REJECTED。
+         *               返回: 无返回值；只有 QUEUED 终态竞争胜出者减少逻辑计数并发布 REJECTED。
          */
         void rejectQueued(String reason) {
             this.rejectionReason = reason;
@@ -4481,10 +5368,10 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：把已受理但失去安全推进条件的任务冻结为 FAILED，保留句柄供故障恢复和人工决策。
+         * 业务作用：把已受理但失去安全推进条件的任务冻结为 FAILED，使句柄可继续读取未执行终态和原因。
          *
          * @param reason 故障原因
-         * 返回: 本次成功把 QUEUED 发布为 FAILED 时返回 true。
+         *               返回: 本次成功把 QUEUED 发布为 FAILED 时返回 true。
          */
         boolean publishFailed(String reason) {
             this.rejectionReason = reason;
@@ -4495,8 +5382,70 @@ public final class Partition {
         }
 
         /**
-         * 业务作用：迁移窗口内登记一次取消请求，由迁移完成或回滚路径在稳定 QUEUED 所有者上帮助提交终态。
+         * 业务作用：由已经取得单条独占清理权的线程发布失败终态、结清当前逻辑计数并解除全部业务强引用。
          *
+         * @param fallbackReason 条目尚无具体原因时使用的故障说明
+         *                       返回: 本次已经完成释放返回 true；条目仍有并发发布者时返回 false，调用方必须保留后续重试责任。
+         */
+        boolean finalizeFailureRetention(String fallbackReason) {
+            while (true) {
+                if (this.moveRecycleGeneration >= 0L
+                        || (int) RETENTION_STATE.getAcquire(this) != RETENTION_FAILURE_HANDLING) return false;
+                int current = (int) STATE.getAcquire(this);
+                if (current == QUEUED || current == FAILED) {
+                    if (!STATE.compareAndSet(this, current, TERMINATING)) continue;
+                    if (this.rejectionReason == null) this.rejectionReason = fallbackReason;
+                    if (current == QUEUED) this.publishOwner(OWNER_FAILED);
+                    LogicalCounter counter = this.logicalCounter;
+                    if (counter != null) {
+                        int remaining = counter.decrement();
+                        if (remaining < 0) {
+                            log.error("Partition failure cleanup logical counter underflow: reason={}",
+                                    this.rejectionReason);
+                        }
+                    }
+                    this.detachFailureRouting();
+                    // FAILED 先于资源释放发布，稳定句柄仍可观察终态；fire-and-forget 条目随后可立即归池。
+                    STATE.setRelease(this, FAILED);
+                    this.releaseDroppedTask();
+                    this.completeFailureCleanupHandling();
+                    return true;
+                }
+                if (current == CANCELLED || current == REJECTED) {
+                    this.detachFailureRouting();
+                    this.releaseDroppedTask();
+                    this.completeFailureCleanupHandling();
+                    return true;
+                }
+                if (current == COMPLETED) {
+                    this.detachFailureRouting();
+                    this.releaseFrameworkOwnership();
+                    this.completeFailureCleanupHandling();
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        /**
+         * 业务作用：在故障条目脱离最后一个物理容器前切断对分区、类型和盗洞的反向引用，防止外部句柄保住整代积压。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 无返回值；提交状态、拒绝原因和回收代次保持不变，供稳定句柄继续查询。
+         */
+        void detachFailureRouting() {
+            this.source = null;
+            this.typeState = null;
+            this.logicalCounter = null;
+            this.nonStrictTunnel = null;
+            this.strictTunnel = null;
+            this.returnContext = null;
+            this.clearMoveDescriptor();
+        }
+
+        /**
+         * 业务作用：迁移窗口内登记一次取消请求，由迁移完成或回滚路径在稳定 QUEUED 所有者上帮助提交终态。
+         * <p>
          * 参数说明: 无。
          * 返回: 本次首次登记取消请求时返回 true；已有请求时返回 false。
          */
@@ -4506,7 +5455,7 @@ public final class Partition {
 
         /**
          * 业务作用：在迁移发布新的稳定逻辑所有者后帮助完成已登记取消，避免调用线程等待迁移 producer 恢复。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本线程或其他帮助者已经把该请求发布为 CANCELLED 时返回 true。
          */
@@ -4517,7 +5466,7 @@ public final class Partition {
 
         /**
          * 业务作用：在当前稳定逻辑所有者上发布 CANCELLED 并只减少一次计数，业务对象留给物理 consumer 回收。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本次 CAS 成功并完成逻辑取消时返回 true；此方法不证明队列已经物理摘除。
          */
@@ -4537,7 +5486,7 @@ public final class Partition {
          * 业务作用：在任务计数不变量破坏时冻结所属类型，并避免把正在发布其它终态的同一条目误作 FAILED 证据。
          *
          * @param reason 已包含具体终态阶段的稳定故障原因
-         * 返回: 无返回值；故障收口异常只记录，不能阻断当前任务发布其真实终态。
+         *               返回: 无返回值；故障收口异常只记录，不能阻断当前任务发布其真实终态。
          */
         void reportLogicalCounterUnderflow(String reason) {
             PartitionSlot origin = this.source;
@@ -4558,7 +5507,7 @@ public final class Partition {
          * 业务作用：安全发布任务所有权终态；业务任务实现异常不能阻断框架计数和资源收口。
          *
          * @param owner 框架终态哨兵
-         * 返回: 无返回值；业务任务引用异常缺失时记录错误，调用方仍须发布稳定框架终态。
+         *              返回: 无返回值；业务任务引用异常缺失时记录错误，调用方仍须发布稳定框架终态。
          */
         void publishOwner(int owner) {
             Task currentTask = this.task();
@@ -4577,7 +5526,7 @@ public final class Partition {
 
         /**
          * 业务作用：原子释放跨线程上下文快照并归还对象池，保证取消、拒绝和完成最多回收一次。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；没有上下文或已被其他终态释放时直接返回。
          */
@@ -4589,21 +5538,26 @@ public final class Partition {
 
         /**
          * 业务作用：释放确定不会执行的业务任务和上下文，并调用对象池取消回收钩子。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；TASK 的原子 getAndSet 防止重复归池。
          */
         void releaseDroppedTask() {
-            this.releaseContext();
-            Task dropped = (Task) TASK.getAndSet(this, null);
-            if (dropped != null) recycleDropped(dropped);
-            // 调用点均位于未入队拒绝或唯一 consumer 物理摘除之后；状态终结本身不能替代这条证明。
-            this.releaseFrameworkOwnership();
+            try {
+                this.releaseContext();
+            } catch (Throwable failure) {
+                log.error("Partition failed to release dropped task context", failure);
+            } finally {
+                Task dropped = (Task) TASK.getAndSet(this, null);
+                if (dropped != null) recycleDropped(dropped);
+                // 调用点均位于未入队拒绝或唯一 consumer 物理摘除之后；状态终结本身不能替代这条证明。
+                this.releaseFrameworkOwnership();
+            }
         }
 
         /**
          * 业务作用：把内部状态映射为公开提交生命周期，不暴露实现用整数编码。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 当前权威状态对应的公开枚举。
          */
@@ -4625,7 +5579,7 @@ public final class Partition {
 
         /**
          * 业务作用：竞争取消尚未开始执行的排队任务，并由胜出者只减少一次逻辑计数。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 本次成功取消 QUEUED 任务时返回 true；其他状态返回 false。
          */
@@ -4637,9 +5591,11 @@ public final class Partition {
                 // DELAYED 到期只能从原状态竞争 ENQUEUEING；先开放完整终态即可关闭执行权，再做外部索引清理。
                 STATE.setRelease(this, CANCELLED);
                 try {
-                    INSTANCE.delayedRegistry.remove(this);
+                    this.partition.delayedRegistry.remove(this);
                     String unique = this.delayUnique;
-                    if (unique != null && TimingWheel.isStarted()) TimingWheel.cancel(unique);
+                    if (unique != null && this.partition.timingWheel.isStarted()) {
+                        this.partition.timingWheel.cancel(unique);
+                    }
                 } catch (Throwable failure) {
                     log.error("Partition failed to clean cancelled delayed registration", failure);
                 } finally {
@@ -4654,7 +5610,7 @@ public final class Partition {
 
         /**
          * 业务作用：返回拒绝或冻结原因，帮助调用方区分未受理与已受理后失败。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: REJECTED/FAILED 的稳定原因；其他状态通常为 null。
          */
@@ -4676,7 +5632,7 @@ public final class Partition {
          * 业务作用：创建绑定延迟引用池的稳定载体，避免定时 Action 直接捕获可复用任务条目。
          *
          * @param pool 所属 DelayedReferencePool
-         * 返回: 构造完成后只持有对象池 handle，任务引用由每次借出初始化。
+         *             返回: 构造完成后只持有对象池 handle，任务引用由每次借出初始化。
          */
         DelayedReference(ObjectPool<DelayedReference> pool) {
             this.handle = new ObjectPool.PooledHandle<>(pool);
@@ -4685,9 +5641,9 @@ public final class Partition {
         /**
          * 业务作用：绑定本次延迟回调持有的任务条目及其借出代次。
          *
-         * @param entry 延迟到期时需要重新路由的条目
+         * @param entry      延迟到期时需要重新路由的条目
          * @param generation 建立回收 hold 时的条目代次
-         * 返回: 无返回值；ActionRecycler 归池前引用保持稳定。
+         *                   返回: 无返回值；ActionRecycler 归池前引用保持稳定。
          */
         void initialize(TaskEntry entry, long generation) {
             this.entry = entry;
@@ -4696,7 +5652,7 @@ public final class Partition {
 
         /**
          * 业务作用：向无捕获到期策略提供当前任务条目，不把引用复制到临时 lambda。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 当前延迟包装唯一绑定的任务条目。
          */
@@ -4706,7 +5662,7 @@ public final class Partition {
 
         /**
          * 业务作用：暴露防重复归池 handle，保证一个定时包装最多归还一次间接引用。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 构造时绑定 DelayedReferencePool 的 handle。
          */
@@ -4717,7 +5673,7 @@ public final class Partition {
 
         /**
          * 业务作用：定时动作正常完成或被取消时解除条目回调 hold，并清除跨生命周期强引用。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 无返回值；带代次释放保证迟到包装不能减少新任务的 hold。
          */
@@ -4736,22 +5692,25 @@ public final class Partition {
      */
     private static final class TaskEntryPool extends ObjectPool<TaskEntry> {
 
+        private final Partition owner;
+
         /**
          * 业务作用：创建有界任务条目池，容量覆盖常见峰值在途量且允许通过系统属性调节。
          *
-         * 参数说明: 无。
-         * 返回: 构造完成后池为空，按需创建 TaskEntry。
+         * @param owner 池内任务条目所属的分区 Runner 内部实现
+         *              返回: 构造完成后池为空，按需创建 TaskEntry。
          */
-        TaskEntryPool() {
+        TaskEntryPool(Partition owner) {
             super(Math.max(1, Integer.getInteger("nasa.object-pool.partition-task-entry-capacity", 20_000)));
+            this.owner = owner;
         }
 
         /**
          * 业务作用：从池中取得条目并初始化本次业务任务、回收代次和句柄策略。
          *
-         * @param task 本次提交的业务任务
+         * @param task        本次提交的业务任务
          * @param autoRecycle fire-and-forget 入口自动释放句柄时为 true
-         * 返回: 状态为 ENQUEUEING 且持有一个框架基础 hold 的任务条目。
+         *                    返回: 状态为 ENQUEUEING 且持有一个框架基础 hold 的任务条目。
          */
         TaskEntry get(Task task, boolean autoRecycle) {
             TaskEntry entry = super.get();
@@ -4761,13 +5720,13 @@ public final class Partition {
 
         /**
          * 业务作用：池为空时创建只绑定本池 handle 的新任务条目。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 尚未绑定业务任务的 TaskEntry。
          */
         @Override
         public TaskEntry newObject() {
-            return new TaskEntry(this);
+            return new TaskEntry(this.owner, this);
         }
     }
 
@@ -4778,7 +5737,7 @@ public final class Partition {
 
         /**
          * 业务作用：创建有界延迟引用池，容量与 TimingWheel 常见任务池规模保持一致。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 构造完成后池为空，可按需扩容到配置上限。
          */
@@ -4790,7 +5749,7 @@ public final class Partition {
          * 业务作用：先为任务条目增加回调 hold，再把条目和代次绑定到池化间接引用。
          *
          * @param entry 将被 TimingWheel 包装持有的任务条目
-         * 返回: 已绑定且由 ActionRecycler refRecycle 槽负责归还的引用载体。
+         *              返回: 已绑定且由 ActionRecycler refRecycle 槽负责归还的引用载体。
          */
         DelayedReference get(TaskEntry entry) {
             long generation = entry.retainRecycleHold();
@@ -4807,13 +5766,213 @@ public final class Partition {
 
         /**
          * 业务作用：池为空时创建绑定本池 handle 的延迟引用。
-         *
+         * <p>
          * 参数说明: 无。
          * 返回: 尚未持有任务条目的 DelayedReference。
          */
         @Override
         public DelayedReference newObject() {
             return new DelayedReference(this);
+        }
+    }
+
+    /**
+     * 按业务执行域隔离的分区消费入口。
+     *
+     * <p>每个 Runner 独占分区槽位、worker、队列、背压、迁移状态、延迟注册表和健康状态，并绑定
+     * 同名 {@link TimingWheel.TimingWheelRunner} 驱动观察与延迟提交。</p>
+     */
+    public static final class PartitionRunner {
+
+        private final String runnerName;
+        private final TimingWheel.TimingWheelRunner timingWheel;
+        private final Partition partition;
+
+        /**
+         * 业务作用：创建绑定同名时间轮与独立分区实现的 Runner，只有 Partition 注册表可以调用。
+         *
+         * @param runnerName  应用级稳定 Runner 名称
+         * @param timingWheel 同名时间轮 Runner
+         *                    返回: 构造完成后分区执行域处于 STOPPED，不接受任务。
+         */
+        private PartitionRunner(String runnerName, TimingWheel.TimingWheelRunner timingWheel) {
+            this.runnerName = runnerName;
+            this.timingWheel = timingWheel;
+            this.partition = new Partition(runnerName, timingWheel);
+        }
+
+        /**
+         * 业务作用：返回 Runner 的稳定注册名称，供日志、指标和业务资源归属诊断使用。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 创建时经过校验且不会变化的 Runner 名称。
+         */
+        public String getRunnerName() {
+            return this.runnerName;
+        }
+
+        /**
+         * 业务作用：返回本分区执行域绑定的时间轮 Runner，供调用方按正确顺序管理生命周期。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 与本 Partition Runner 同名且运行期不可更换的 TimingWheel Runner。
+         */
+        public TimingWheel.TimingWheelRunner getTimingWheel() {
+            return this.timingWheel;
+        }
+
+        /**
+         * 业务作用：启动本 Runner 的独立分区集群，完整创建队列和 worker 后才开放提交。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 当前 Runner；绑定时间轮未启动或停机尚未收口时抛出 IllegalStateException。
+         */
+        public PartitionRunner start() {
+            this.partition.startInternal();
+            return this;
+        }
+
+        /**
+         * 业务作用：关闭本 Runner 的新提交并排空其健康队列，不停止绑定时间轮或其它 Runner。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 完整收口并发布 STOPPED 时返回 true；任一阶段超时返回 false。
+         */
+        public boolean stop() {
+            return this.partition.stopInternal();
+        }
+
+        /**
+         * 业务作用：判断本 Runner 是否已经完整开放提交。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 当前生命周期为 ACCEPTING 时返回 true。
+         */
+        public boolean isStarted() {
+            return this.partition.runnerStarted();
+        }
+
+        /**
+         * 业务作用：判断本 Runner 的观察控制依赖是否完整且没有分区故障。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 分区已启动、没有失败分区且绑定时间轮仍是登记观察任务的同一启动代次时返回 true；
+         * false 不等同于实例不可收单，时间轮被单独重启后须重启本 Runner 恢复控制能力。
+         */
+        public boolean isHealthy() {
+            return this.partition.runnerHealthy();
+        }
+
+        /**
+         * 业务作用：暴露本 Runner 已经失败关闭的原始分区数量，供局部熔断与恢复决策使用。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 当前代已发布分区级 FAILED 的槽位数。
+         */
+        public int failedPartitionCount() {
+            return this.partition.runnerFailedPartitionCount();
+        }
+
+        /**
+         * 业务作用：返回本 Runner 当前代实际分区数，供容量监控和路由诊断使用。
+         * <p>
+         * 参数说明: 无。
+         * 返回: 已启动或停机收口中的槽位数；完全停止时为 0。
+         */
+        public int partitionCount() {
+            return this.partition.runnerPartitionCount();
+        }
+
+        /**
+         * 业务作用：按对象 key 路由并立即提交 typed 分区任务到本 Runner。
+         *
+         * @param key  路由 key；null 固定落到 hash 0
+         * @param task 业务任务
+         *             返回: 与本 Runner 内部任务状态共用权威的稳定提交句柄。
+         */
+        public Submission submit(Object key, Task task) {
+            return this.partition.submitForRunner(key, task);
+        }
+
+        /**
+         * 业务作用：按 primitive long key 无装箱路由并立即提交 typed 分区任务到本 Runner。
+         *
+         * @param key  long 路由 key
+         * @param task 业务任务
+         *             返回: 与本 Runner 内部任务状态共用权威的稳定提交句柄。
+         */
+        public Submission submit(long key, Task task) {
+            return this.partition.submitForRunner(key, task);
+        }
+
+        /**
+         * 业务作用：按对象 key 登记本 Runner 的延迟分区任务，到期时才读取当前路由。
+         *
+         * @param key         路由 key；null 固定落到 hash 0
+         * @param delayMillis 延迟毫秒数
+         * @param task        业务任务
+         *                    返回: 可在到期前取消的稳定提交句柄。
+         */
+        public Submission submit(Object key, long delayMillis, Task task) {
+            return this.partition.submitForRunner(key, delayMillis, task);
+        }
+
+        /**
+         * 业务作用：按 primitive long key 无装箱登记本 Runner 的延迟分区任务。
+         *
+         * @param key         long 路由 key
+         * @param delayMillis 延迟毫秒数
+         * @param task        业务任务
+         *                    返回: 可在到期前取消的稳定提交句柄。
+         */
+        public Submission submit(long key, long delayMillis, Task task) {
+            return this.partition.submitForRunner(key, delayMillis, task);
+        }
+
+        /**
+         * 业务作用：按对象 key 立即提交无需状态句柄的任务到本 Runner，并自动释放内部条目。
+         *
+         * @param key  路由 key；null 固定落到 hash 0
+         * @param task 业务任务
+         *             返回: 无返回值。
+         */
+        public void exec(Object key, Task task) {
+            this.partition.execForRunner(key, task);
+        }
+
+        /**
+         * 业务作用：按 primitive long key 无装箱立即提交无需状态句柄的任务到本 Runner。
+         *
+         * @param key  long 路由 key
+         * @param task 业务任务
+         *             返回: 无返回值。
+         */
+        public void exec(long key, Task task) {
+            this.partition.execForRunner(key, task);
+        }
+
+        /**
+         * 业务作用：按对象 key 登记无需状态句柄的延迟任务到本 Runner，并自动释放内部条目。
+         *
+         * @param key         路由 key；null 固定落到 hash 0
+         * @param delayMillis 延迟毫秒数
+         * @param task        业务任务
+         *                    返回: 无返回值。
+         */
+        public void exec(Object key, long delayMillis, Task task) {
+            this.partition.execForRunner(key, delayMillis, task);
+        }
+
+        /**
+         * 业务作用：按 primitive long key 无装箱登记无需状态句柄的延迟任务到本 Runner。
+         *
+         * @param key         long 路由 key
+         * @param delayMillis 延迟毫秒数
+         * @param task        业务任务
+         *                    返回: 无返回值。
+         */
+        public void exec(long key, long delayMillis, Task task) {
+            this.partition.execForRunner(key, delayMillis, task);
         }
     }
 }

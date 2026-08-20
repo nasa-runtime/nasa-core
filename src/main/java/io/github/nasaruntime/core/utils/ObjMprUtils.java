@@ -57,7 +57,7 @@ public abstract class ObjMprUtils {
     }
 
     /**
-     * 业务作用：取得带缩进输出的 ObjectMapper，供日志与调试使用。
+     * 业务作用：取得带缩进输出的 ObjectMapper，供日志与结构诊断使用。
      *
      * 参数说明: 无。
      * 返回: 格式化输出的 ObjectMapper。

@@ -152,8 +152,7 @@ public class DefaultSimpleCache<K, V> implements SimpleCache<K, V>, Clearable, R
 
     /**
      * 业务作用：只读地取得 hash 字段值，一级键不存在时不创建任何条目。
-     * 早期实现在此走建桶路径，导致每个被查询过但从未写入的键都会永久留下一个空 map，
-     * 对只读多写少的访问模式即为无界增长。
+     * 只读路径不得调用建桶入口，否则每个只查询不写入的键都会留下空 map，形成无界增长。
      *
      * @param k 一级缓存键
      * @param hk hash 字段名

@@ -443,7 +443,7 @@ public class MPSCLinkedQueue<E> extends MPSCQPad2<E> implements Queue<E>, Serial
     }
 
     /**
-     * 业务作用：报告队列是否已经出现无法用 POISON 修复的永久死槽，供上层立即关闭对应分区或类型路由。
+     * 业务作用：报告队列是否已经出现无法用 POISON 恢复的永久死槽，供上层立即关闭对应分区或类型路由。
      *
      * 参数说明: 无。
      * 返回: 已记录永久死槽时返回 true；普通 offer 异常但 POISON 补写成功时返回 false。
@@ -674,6 +674,55 @@ public class MPSCLinkedQueue<E> extends MPSCQPad2<E> implements Queue<E>, Serial
         ArrayList<E> list = new ArrayList<>();
         this.forEach(list::add);
         return list.toArray(generator);
+    }
+
+    /**
+     * 业务作用：在所有 producer 已经确定退出后跨过永久空洞，逐项摘除仍发布在槽位中的业务元素并切断已消费块引用。
+     * 该入口只用于关闭故障队列；与 producer 并发会遗漏迟到发布，多个 consumer 并发会重复处置同一元素。
+     *
+     * @param action 每个已发布业务元素的终态处置动作，POISON 与未发布空槽不会传入
+     * 返回: 实际交给 action 的元素数；action 异常时仍清空其余槽位，最后重新抛出首次异常。
+     */
+    public int drainPublishedAfterProducersStop(Consumer<? super E> action) {
+        Objects.requireNonNull(action, "action");
+        long cursor = this.consumerIndex;
+        long end = (long) P_INDEX.getAcquire(this);
+        MPSCChunk<E> chunk = this.consumerChunk;
+        MPSCChunk<E> last = chunk;
+        int drained = 0;
+        Throwable firstFailure = null;
+
+        while (cursor < end) {
+            long chunkId = cursor >> CHUNK_SHIFT;
+            while (chunk != null && chunk.index < chunkId) {
+                MPSCChunk<E> next = chunk.lvNext();
+                if (next != null) next.soPrev(null);
+                chunk = next;
+            }
+            if (chunk == null || chunk.index != chunkId) break;
+            last = chunk;
+            int offset = (int) (cursor & CHUNK_MASK);
+            Object element = chunk.lvElement(offset);
+            chunk.soElement(offset, null);
+            cursor++;
+            if (element == null || element == MPSCChunk.POISON) continue;
+            drained++;
+            try {
+                action.accept((E) element);
+            } catch (Throwable failure) {
+                if (firstFailure == null) firstFailure = failure;
+            }
+        }
+
+        C_INDEX.setRelease(this, end);
+        if (last != null) {
+            this.consumerChunk = last;
+            last.soPrev(null);
+        }
+        if (firstFailure instanceof RuntimeException runtime) throw runtime;
+        if (firstFailure instanceof Error error) throw error;
+        if (firstFailure != null) throw new IllegalStateException("MPSC failure drain action failed", firstFailure);
+        return drained;
     }
 
     // ==================== clear ====================

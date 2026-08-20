@@ -829,7 +829,7 @@ public class RecycleLinkedList<E> extends AbstractSequentialList<E>
      * <li>action 内 {@code list.remove(currentElement)} — 删当前已访问的元素</li>
      * <li>action 内 {@link #removeLast()} 等删<b>已访问过</b>的尾部元素</li>
      * <li>action 内 {@link #add(Object)} / {@link #addLast(Object)} 追加到末尾 (新 tail 不在反向迭代路径上, 不影响)</li>
-     * <li>action 内删除远处尚未访问的元素 (非紧邻 cursor 的 prev 那个) — 解链时前后指针被正确修复, 跳过即可</li>
+     * <li>action 内删除远处尚未访问的元素 (非紧邻 cursor 的 prev 那个) — 解链时前后指针会重新连接, 跳过即可</li>
      * </ul>
      * <b>不安全 (静默错乱, 无 fail-fast)</b>:
      * <ul>
