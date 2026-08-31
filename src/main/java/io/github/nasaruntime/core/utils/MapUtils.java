@@ -1,6 +1,5 @@
 package io.github.nasaruntime.core.utils;
 
-import com.google.common.util.concurrent.AtomicDouble;
 import io.github.nasaruntime.core.enums.Sort;
 import io.github.nasaruntime.core.exception.JsonException;
 import io.github.nasaruntime.core.function.FunctionUtils;
@@ -607,31 +606,6 @@ public abstract class MapUtils {
 	}
 
 	/**
-	 * 业务作用：按键从映射中取值并转换成 AtomicDouble，同时容忍映射为 null 与键不存在，省去调用方逐处判空与强转。
-	 *
-	 * @param map 源映射
-	 * @param key 键
-	 * 返回: 转换后的 AtomicDouble；映射为 null、键不存在或无法转换时返回默认值（未提供默认值时为 null）。
-	 */
-	public static <K> AtomicDouble getAtomicDouble(Map map, K key) {
-		Object obj = getObject(map, key);
-		if (Objects.isNull(obj)) {
-			return null;
-		}
-		if (obj instanceof AtomicDouble) {
-			return (AtomicDouble) obj;
-		}
-		if (obj instanceof Number num) {
-			return new AtomicDouble(num.doubleValue());
-		}
-		try {
-			return obj instanceof String os ? new AtomicDouble(Double.parseDouble(os)) : null;
-		} catch (Exception e) {
-			throw new JsonException(e.getMessage(), e);
-		}
-	}
-
-	/**
 	 * 业务作用：按键从映射中取值并转换成 AtomicBoolean，同时容忍映射为 null 与键不存在，省去调用方逐处判空与强转。
 	 *
 	 * @param map 源映射
@@ -835,19 +809,6 @@ public abstract class MapUtils {
 	 */
 	public static <K> AtomicLong getAtomicLong(Map map, K key, AtomicLong dftVal) {
 		AtomicLong obj = getAtomicLong(map, key);
-		return Objects.isNull(obj) ? dftVal : obj;
-	}
-
-	/**
-	 * 业务作用：按键从映射中取值并转换成 AtomicDouble，同时容忍映射为 null 与键不存在，省去调用方逐处判空与强转。
-	 *
-	 * @param map 源映射
-	 * @param key 键
-	 * @param dftVal 见上述说明
-	 * 返回: 转换后的 AtomicDouble；映射为 null、键不存在或无法转换时返回默认值（未提供默认值时为 null）。
-	 */
-	public static <K> AtomicDouble getAtomicDouble(Map map, K key, AtomicDouble dftVal) {
-		AtomicDouble obj = getAtomicDouble(map, key);
 		return Objects.isNull(obj) ? dftVal : obj;
 	}
 
@@ -1068,19 +1029,6 @@ public abstract class MapUtils {
 	 */
 	public static <K> AtomicLong getAtomicLong(Map map, K key, Function<K, AtomicLong> getter) {
 		AtomicLong obj = getAtomicLong(map, key);
-		return Objects.isNull(obj) ? getter.apply(key) : obj;
-	}
-
-	/**
-	 * 业务作用：按键从映射中取值并转换成 AtomicDouble，同时容忍映射为 null 与键不存在，省去调用方逐处判空与强转。
-	 *
-	 * @param map 源映射
-	 * @param key 键
-	 * @param getter 取值函数
-	 * 返回: 转换后的 AtomicDouble；映射为 null、键不存在或无法转换时返回默认值（未提供默认值时为 null）。
-	 */
-	public static <K> AtomicDouble getAtomicDouble(Map map, K key, Function<K, AtomicDouble> getter) {
-		AtomicDouble obj = getAtomicDouble(map, key);
 		return Objects.isNull(obj) ? getter.apply(key) : obj;
 	}
 

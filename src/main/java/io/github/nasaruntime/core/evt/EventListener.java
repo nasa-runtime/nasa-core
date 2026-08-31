@@ -30,11 +30,10 @@ public interface EventListener<T, TS> extends EventTopic, Initialization {
     }
 
     /**
-     * 业务作用：消费回调。{@code TS} 由具体子接口决定（Single 为 T，Batch 为 {@code List<T>}）。
-     * 失败语义因运行模式而不同，实现方必须据此决定幂等性：
-     * PROXY 模式抛异常交由框架的 errorHandler 处理；
-     * PARTITION 模式抛异常则不 ACK，消息留在 pending 中并在 30 秒后被 XAUTOCLAIM 重投，
-     * 因此该模式下的业务逻辑必须幂等，否则重投会造成重复副作用。
+     * 业务作用：接收接入层完成路由和反序列化后的事件。{@code TS} 由具体子接口决定，
+     * 可以是单条事件，也可以是接入层定义的批量结构。
+     * 消息确认、offset 提交、失败重试和重复投递语义由具体接入层约定，实现方必须按照对应协议
+     * 决定幂等边界，不能把本接口的正常返回或异常直接解释为统一的交付保证。
      *
      * @param data 已反序列化的事件数据
      * 返回: 无返回值；正常返回即视为消费成功。

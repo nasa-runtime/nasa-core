@@ -1,6 +1,6 @@
 package io.github.nasaruntime.core.utils;
 
-import com.alibaba.fastjson2.JSONArray;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.github.nasaruntime.core.cache.DefaultSimpleCache;
 import io.github.nasaruntime.core.cache.Reloadable;
 import io.github.nasaruntime.core.cache.SimpleCache;
@@ -193,17 +193,7 @@ public abstract class Translator {
 
             final String lt = langTo;
 
-            // 注意：在使用String进行同步的时候，一定要使用intern()方法，表示同步String的值
-            // synchronized (url.intern()) {}
-            // 但是，强烈建议不要这样使用！！！
-            // 请看资料：http://www.JVMshuo.com/article/p-wnwhtbqv-u.html
-            //
-            // 这里也强烈建议不要使用Google的Guava实现的Striped实现lock
-            // Striped放弃了String的equals，而是采用了idx方式，去求取String的hash值
-            // 这样的话不同的key就有可能进入同一个hash桶，从而获取同一个锁，最终导致死锁！！！
-            // 请看资料：https://www.iflym.com/index.php/code/201611190001.html
-            //
-            // 以下是我自己实现的同步方案，想研究的请自行去看源码
+            // 同一翻译请求只允许一个线程回源，避免并发缓存未命中时重复访问远程服务。
             return SyncLock.lock(Translator.class.getName() + url, () -> {
                 String wt = simpleCache.get(cacheKey);
                 if (StringUtils.isNotBlank(wt)) {
@@ -253,7 +243,9 @@ public abstract class Translator {
                 while (Objects.nonNull(inputLine = reader.readLine())) {
                     response.append(inputLine);
                 }
-                return JSONArray.parse(response.toString()).getJSONArray(0).getJSONArray(0).getString(0);
+                // 译文固定在响应前三层数组的首元素；结构不完整时返回 null，由上层回退原文。
+                JsonNode root = ObjMprUtils.OBJECT_MAPPER.readTree(response.toString());
+                return root.path(0).path(0).path(0).textValue();
             }
         } catch (Exception e) {
             log.error("Google翻译失败：{}", e.getMessage(), e);

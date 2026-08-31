@@ -6,7 +6,7 @@
 
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-core</artifactId>
-    <version>1.0.3</version>
+    <version>1.0.4</version>
     <packaging>jar</packaging>
 
     <name>nasa-core</name>
@@ -55,9 +55,7 @@
         <project.build.outputTimestamp>2026-08-20T00:00:00Z</project.build.outputTimestamp>
 
         <commons-codec.version>1.19.0</commons-codec.version>
-        <fastjson2.version>2.0.59</fastjson2.version>
-        <graal-sdk.version>25.0.0</graal-sdk.version>
-        <guava.version>33.5.0-jre</guava.version>
+        <graalvm-nativeimage.version>25.0.0</graalvm-nativeimage.version>
         <jackson.version>2.19.4</jackson.version>
         <lombok.version>1.18.42</lombok.version>
         <slf4j.version>2.0.17</slf4j.version>
@@ -90,24 +88,14 @@
             <version>${commons-codec.version}</version>
         </dependency>
         <dependency>
-            <groupId>com.google.guava</groupId>
-            <artifactId>guava</artifactId>
-            <version>${guava.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.alibaba.fastjson2</groupId>
-            <artifactId>fastjson2</artifactId>
-            <version>${fastjson2.version}</version>
-        </dependency>
-        <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
             <version>${slf4j.version}</version>
         </dependency>
         <dependency>
             <groupId>org.graalvm.sdk</groupId>
-            <artifactId>graal-sdk</artifactId>
-            <version>${graal-sdk.version}</version>
+            <artifactId>nativeimage</artifactId>
+            <version>${graalvm-nativeimage.version}</version>
             <scope>provided</scope>
         </dependency>
         <dependency>

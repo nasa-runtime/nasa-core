@@ -1,6 +1,5 @@
 package io.github.nasaruntime.core.base;
 
-import com.google.common.util.concurrent.AtomicDouble;
 import io.github.nasaruntime.core.utils.MapUtils;
 import io.github.nasaruntime.core.utils.StringUtils;
 import lombok.extern.slf4j.Slf4j;
@@ -358,27 +357,6 @@ public abstract class AnyHolder {
      */
     public static AtomicBoolean getAtomicBoolean(String key, AtomicBoolean dft) {
         return MapUtils.getAtomicBoolean(ANY.get(), key, dft);
-    }
-
-    /**
-     * 业务作用：按键从当前线程上下文读取值并转换成 AtomicDouble，容忍键不存在，省去调用方逐处判空与强转。
-     *
-     * @param key 上下文键
-     * 返回: 转换后的 AtomicDouble；键不存在或无法转换时返回默认值（未给默认值时为 null）。
-     */
-    public static AtomicDouble getAtomicDouble(String key) {
-        return MapUtils.getAtomicDouble(ANY.get(), key);
-    }
-
-    /**
-     * 业务作用：按键从当前线程上下文读取值并转换成 AtomicDouble，容忍键不存在，省去调用方逐处判空与强转。
-     *
-     * @param key 上下文键
-     * @param dft 取不到时返回的默认值
-     * 返回: 转换后的 AtomicDouble；键不存在或无法转换时返回默认值（未给默认值时为 null）。
-     */
-    public static AtomicDouble getAtomicDouble(String key, AtomicDouble dft) {
-        return MapUtils.getAtomicDouble(ANY.get(), key, dft);
     }
 
     /**

@@ -8,7 +8,7 @@
 <dependency>
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-core</artifactId>
-    <version>1.0.3</version>
+    <version>1.0.4</version>
 </dependency>
 ```
 
@@ -47,6 +47,12 @@
 ### Partition —— 按 key 路由的分区任务执行器，带任务窃取
 
 把任务按业务 key 哈希到固定原始分区，每个分区一条 worker 独占消费自己的 MPSC 队列。严格任务在“原始分区 + taskType”边界内维持 FIFO；非严格任务允许经多个盗洞并行分发和任务粒度重排，因此不能把“同 key”一概理解为串行执行。空闲 worker 由任务发布直接唤醒，不做周期性全局扫描；每个 `PartitionRunner` 各有一条绑定同名 `TimingWheelRunner` 的 1ms 观察任务，持续调度本执行域的活动迁移审计并定向唤醒责任 worker，其中每秒执行一次集中热点扫描并安装“盗洞”。
+
+消息接入层可以通过 `PartitionedEventListener<T, TS>` 声明 Partition 路由能力：
+`partitionKey(T)` 返回业务顺序域的路由键，返回 `null` 表示不要求按键保序；`partition()` 返回指定的
+`PartitionRunner`，返回 `null` 表示由接入层提供默认执行器。该接口只声明监听器能力，不负责消息确认、
+offset 连续提交、消费组 fencing、背压或 Runner 生命周期；Redis、Kafka 等接入层必须按照各自投递协议
+完成这些控制，并明确区分普通监听器与 Partition 监听器，不能仅凭默认返回值推断运行模式。
 
 ```java
 // Partition 的延迟提交与归还收口依赖 TimingWheel，必须先启动时间轮。
