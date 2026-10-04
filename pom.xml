@@ -10,7 +10,7 @@
     <packaging>jar</packaging>
 
     <name>nasa-core</name>
-    <description>按 Runner 隔离、带失败收口的分区任务窃取、分层时间轮、堆内对象池与雪花 ID 的纯 Java 21 运行时库</description>
+    <description>适用于 JDK 21 及以上版本的纯 Java 运行时库，提供按 Runner 隔离、带失败收口的分区任务窃取、分层时间轮、堆内对象池与雪花 ID</description>
     <url>https://github.com/nasa-runtime/nasa-core</url>
     <inceptionYear>2026</inceptionYear>
 
@@ -49,6 +49,7 @@
     </issueManagement>
 
     <properties>
+        <!-- 产物保持 Java 21 API 与字节码基线，构建和运行允许使用更高版本的 JDK。 -->
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
@@ -116,11 +117,42 @@
                     <include>LICENSE</include>
                     <include>LICENSE-APACHE</include>
                     <include>LICENSE-MIT</include>
-                    <include>README.md</include>
+                    <include>README*.md</include>
+                    <include>CONTRIBUTING*.md</include>
+                    <include>SECURITY*.md</include>
                 </includes>
             </resource>
         </resources>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <execution>
+                        <id>javadoc-public-resources</id>
+                        <phase>generate-resources</phase>
+                        <goals><goal>copy-resources</goal></goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/javadoc-resources/doc-files</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>${project.basedir}</directory>
+                                    <filtering>false</filtering>
+                                    <includes>
+                                        <include>LICENSE</include>
+                                        <include>LICENSE-APACHE</include>
+                                        <include>LICENSE-MIT</include>
+                                        <include>README*.md</include>
+                                        <include>CONTRIBUTING*.md</include>
+                                        <include>SECURITY*.md</include>
+                                    </includes>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-enforcer-plugin</artifactId>
@@ -138,6 +170,7 @@
                                 </requireMavenVersion>
                                 <requireJavaVersion>
                                     <version>[21,)</version>
+                                    <message>构建需要 JDK 21 或更高版本。</message>
                                 </requireJavaVersion>
                                 <dependencyConvergence/>
                             </rules>
@@ -196,6 +229,8 @@
                 <artifactId>maven-javadoc-plugin</artifactId>
                 <version>3.12.0</version>
                 <configuration>
+                    <javadocDirectory>${project.build.directory}/javadoc-resources</javadocDirectory>
+                    <docfilessubdirs>true</docfilessubdirs>
                     <encoding>UTF-8</encoding>
                     <docencoding>UTF-8</docencoding>
                     <charset>UTF-8</charset>

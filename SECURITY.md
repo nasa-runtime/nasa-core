@@ -1,5 +1,7 @@
 # 安全策略
 
+[中文](SECURITY.md) | [English](SECURITY.en.md)
+
 ## 支持范围
 
 安全维护只面向当前最新发布版本。Central 上的既有版本不可覆盖；安全更新会通过新的补丁版本发布。

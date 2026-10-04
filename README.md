@@ -1,5 +1,7 @@
 # nasa-core
 
+[中文](README.md) | [English](README.en.md)
+
 面向高吞吐、低 GC 场景的纯 Java 运行时基础库。核心是三块自研的运行时设施——**分区任务窃取执行器 `Partition`**、**分层时间轮 `TimingWheel`** 和**堆内对象池 `ObjectPool`**——以及围绕它们的无锁并发容器、可回收集合、雪花 ID 与协议编解码能力。`Partition` 与 `TimingWheel` 都支持按稳定 Runner 名称隔离任务状态、执行资源、背压和生命周期；已受理任务失去安全推进条件时会发布可观察终态并主动解除业务强引用，不把失败留存交给 GC 猜测处理。
 
 不依赖任何容器或框架，不继承外部 parent POM，日志只依赖 `slf4j-api`。
@@ -12,7 +14,9 @@
 </dependency>
 ```
 
-要求 JDK 21+（使用虚拟线程与 Java 21 语法），Maven 3.6.3+。
+构建与运行最低要求 JDK 21，允许使用更高版本；构建工具要求 Maven 3.6.3+。
+Maven 的 JDK 要求为 `[21,)`，不设上限；`release=21` 保持 Java 21 API 与字节码基线，不限定构建或运行必须使用 JDK 21。
+源码构建还要求 Lombok 与所用 JDK 的编译器兼容；当前构建依赖使用 Lombok `1.18.42`，可选用 JDK 21 或 25 构建。
 
 ---
 
@@ -294,7 +298,7 @@ long[] batch = ids.generate(1_000); // 一次加锁完成批量生成
 mvn -B -ntp clean verify
 ```
 
-编译产物是 Java 21 字节码，低于 JDK 21 的项目无法加载本库。
+编译产物是 Java 21 字节码，可在 JDK 21 及以上版本加载；使用更高版本 JDK 构建本库时仍保持 `release=21`。
 
 ## 参与和安全
 

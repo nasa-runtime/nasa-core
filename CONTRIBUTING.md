@@ -1,11 +1,16 @@
 # 贡献指南
 
+[中文](CONTRIBUTING.md) | [English](CONTRIBUTING.en.md)
+
 感谢你为 nasa-core 提交改进。开始修改前，请先在 GitHub Issue 中说明问题背景、兼容性影响和预期行为；小型且边界清晰的修正可以直接提交 Pull Request。
 
 ## 开发环境
 
 - JDK 21 或更高版本
 - Maven 3.6.3 或更高版本
+
+Maven 接受 `[21,)` 范围的 JDK，不设上限；使用更高版本 JDK 构建时仍保持 `release=21`，避免提高产物最低要求。
+源码构建使用 Lombok `1.18.42`，建议选用 JDK 21 或 25；其它 JDK 编译器需要与该注解处理器兼容。
 
 构建命令：
 
